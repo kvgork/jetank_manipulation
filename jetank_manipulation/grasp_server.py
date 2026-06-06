@@ -10,6 +10,9 @@ Sequence:
 
 Gripper is commanded by publishing std_msgs/Float64MultiArray on
 /gripper_controller/commands (JointGroupPositionController, not a MoveIt controller).
+The gripper_controller is configured with joints: [gripper_left_joint] only; the
+mimic joint (gripper_right_joint) is driven by the Gazebo physics mimic constraint.
+Hence we publish a single-element array [width].
 
 Usage:
   ros2 run jetank_manipulation grasp_server --ros-args -p use_sim_time:=true
@@ -237,7 +240,9 @@ class GraspServer(Node):
 
         def command_gripper(width: float) -> None:
             msg = Float64MultiArray()
-            msg.data = [width, width]
+            # gripper_controller joints: [gripper_left_joint] only.
+            # gripper_right_joint is driven by the physics mimic constraint.
+            msg.data = [width]
             self._gripper_pub.publish(msg)
 
         async def move_to(target_name: str) -> bool:
