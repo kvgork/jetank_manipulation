@@ -124,16 +124,20 @@ _SRDF_STATES: dict = {
         "S3_joint": 1.047,
         "S5_joint": 0.0,
     },
+    # Tuned 2026-06-06 against sim (widened S3 +/-2.356) to reach as low in front
+    # as the arm allows: pre ~0.19 m, reach ~0.15 m above floor. The arm cannot
+    # touch the floor with the current URDF primitive link lengths — raise the
+    # target onto a low riser, or correct link lengths to real dims.
     "grasp_pre": {
         "S1_joint": 0.0,
-        "S2_joint": -0.6,
-        "S3_joint": 0.8,
+        "S2_joint": -1.0,
+        "S3_joint": 1.5,
         "S5_joint": 0.0,
     },
     "grasp_reach": {
         "S1_joint": 0.0,
         "S2_joint": -1.0,
-        "S3_joint": 1.2,
+        "S3_joint": 2.0,
         "S5_joint": 0.0,
     },
 }
