@@ -128,18 +128,23 @@ _SRDF_STATES: dict = {
     # as the arm allows: pre ~0.19 m, reach ~0.15 m above floor. The arm cannot
     # touch the floor with the current URDF primitive link lengths — raise the
     # target onto a low riser, or correct link lengths to real dims.
-    # Positive S2 swings the arm FORWARD-and-down (the natural reach toward an
-    # object in front), measured 2026-06-06: pre = forward/raised, reach =
-    # forward/low (~0.14 m above floor, x~0.15 m in front).
+    # LOWEST COLLISION-FREE forward reach (2026-06-06). The arm can kinematically
+    # reach ~0.06 m above the floor, but below ~0.10 m the wrist (S5_link) self-
+    # collides with the arm-mounted camera (camera_link) and move_group refuses
+    # to plan there. Lowest move_group-valid pose:
+    #   grasp_pre  S2=1.0 S3=0.0 -> x~0.225 z~0.152 (forward, raised)
+    #   grasp_reach S2=1.0 S3=1.0 -> x~0.147 z~0.105 (forward, ~0.08 m above floor)
+    # To go lower: resolve the S5_link<->camera_link collision (relocate camera or
+    # disable the pair if the primitive boxes are over-conservative).
     "grasp_pre": {
         "S1_joint": 0.0,
-        "S2_joint": 0.6,
+        "S2_joint": 1.0,
         "S3_joint": 0.0,
         "S5_joint": 0.0,
     },
     "grasp_reach": {
         "S1_joint": 0.0,
-        "S2_joint": 0.6,
+        "S2_joint": 1.0,
         "S3_joint": 1.0,
         "S5_joint": 0.0,
     },
