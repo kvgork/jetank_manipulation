@@ -11,12 +11,13 @@
       retreat: "grasp_pre"
       park: "home"
 
-    # Gripper direct-command widths (metres) published to /gripper_controller/commands.
-    # gripper_left_joint is prismatic 0..0.04 m; right is mimic.
-    # Format: [left_width, right_width] — both receive the same value.
+    # Gripper command widths (metres), sent via the
+    # /gripper_controller/gripper_cmd GripperCommand action (control_msgs).
+    # gripper_left_joint is prismatic 0..0.04 m; the right finger mimics it.
     gripper:
       open_width: 0.04    # fully open
       close_width: 0.0    # fully closed
+      max_effort: 5.0     # GripperCommand max_effort (N); 0 = unlimited
       # Dwell time (seconds) after publishing the gripper command before continuing.
       # Increase if the physical gripper is slow to reach its target.
       dwell_after_open_s: 0.5
