@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# ROS2 / colcon
+install/
+log/
+build/
+
+# Editor
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store

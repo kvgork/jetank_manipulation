@@ -1,0 +1,31 @@
+/**:
+  ros__parameters:
+    # Named arm targets matching SRDF group_states (jetank_moveit_config/config/jetank.srdf).
+    # Sequence: ready -> grasp_pre -> (open gripper) -> grasp_reach -> (close gripper) -> ready -> home
+    arm_targets:
+      approach: "ready"
+      pre_grasp: "grasp_pre"
+      grasp: "grasp_reach"
+      retreat: "ready"
+      park: "home"
+
+    # Gripper direct-command widths (metres) published to /gripper_controller/commands.
+    # gripper_left_joint is prismatic 0..0.04 m; right is mimic.
+    # Format: [left_width, right_width] — both receive the same value.
+    gripper:
+      open_width: 0.04    # fully open
+      close_width: 0.0    # fully closed
+      # Dwell time (seconds) after publishing the gripper command before continuing.
+      # Increase if the physical gripper is slow to reach its target.
+      dwell_after_open_s: 0.5
+      dwell_after_close_s: 0.8
+
+    # MoveIt2 motion parameters applied to every arm plan.
+    motion:
+      velocity_scaling: 0.3         # fraction of max joint velocity (0..1)
+      acceleration_scaling: 0.3     # fraction of max joint acceleration (0..1)
+      allowed_planning_time_s: 5.0  # seconds for OMPL to find a plan
+      num_planning_attempts: 3      # retries per stage before aborting
+
+    # Whether to use ROS sim time (set to true when running in Gazebo).
+    use_sim_time: true

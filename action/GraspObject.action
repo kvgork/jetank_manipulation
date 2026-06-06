@@ -1,0 +1,9 @@
+# Goal
+string object_hint   # unused in Phase 1 (open-loop preset grasp); reserved for Phase 2 vision-targeted grasp
+---
+# Result
+bool success
+string message
+---
+# Feedback
+string stage
