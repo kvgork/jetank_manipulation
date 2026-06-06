@@ -150,7 +150,6 @@ class GraspServer(Node):
         super().__init__("grasp_server")
 
         # Parameters (all tunable via grasp_poses.yaml)
-        self.declare_parameter("use_sim_time", True)
         self.declare_parameter("motion.velocity_scaling", 0.3)
         self.declare_parameter("motion.acceleration_scaling", 0.3)
         self.declare_parameter("motion.allowed_planning_time_s", 5.0)
@@ -364,7 +363,10 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
