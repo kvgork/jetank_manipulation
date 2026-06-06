@@ -1,12 +1,14 @@
 /**:
   ros__parameters:
     # Named arm targets matching SRDF group_states (jetank_moveit_config/config/jetank.srdf).
-    # Sequence: ready -> grasp_pre -> (open gripper) -> grasp_reach -> (close gripper) -> ready -> home
+    # Sequence: grasp_pre -> (open) -> grasp_reach -> (close) -> grasp_pre -> home
+    # Approach/retreat use the FORWARD grasp_pre (NOT the legacy backward-tilted
+    # "ready", S2=-0.785) so the whole motion unfolds forward — no back-swing.
     arm_targets:
-      approach: "ready"
+      approach: "grasp_pre"
       pre_grasp: "grasp_pre"
       grasp: "grasp_reach"
-      retreat: "ready"
+      retreat: "grasp_pre"
       park: "home"
 
     # Gripper direct-command widths (metres) published to /gripper_controller/commands.
