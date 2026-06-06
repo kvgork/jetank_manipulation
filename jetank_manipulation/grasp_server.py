@@ -136,16 +136,19 @@ _SRDF_STATES: dict = {
     #   grasp_reach S2=1.0 S3=1.0 -> x~0.147 z~0.105 (forward, ~0.08 m above floor)
     # To go lower: resolve the S5_link<->camera_link collision (relocate camera or
     # disable the pair if the primitive boxes are over-conservative).
+    # Set from RViz by the user 2026-06-06 (degrees -> rad):
+    #   grasp_reach: S2=100deg=1.745, S3=-15deg=-0.262
+    #   grasp_pre:   derived raised approach (S2=70deg=1.222, same S3)
     "grasp_pre": {
         "S1_joint": 0.0,
-        "S2_joint": 1.0,
-        "S3_joint": 0.0,
+        "S2_joint": 1.222,
+        "S3_joint": -0.262,
         "S5_joint": 0.0,
     },
     "grasp_reach": {
         "S1_joint": 0.0,
-        "S2_joint": 1.0,
-        "S3_joint": 1.0,
+        "S2_joint": 1.745,
+        "S3_joint": -0.262,
         "S5_joint": 0.0,
     },
 }
