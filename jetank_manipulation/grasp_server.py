@@ -8,11 +8,9 @@ arm motion through the MoveGroup action (moveit_msgs/action/MoveGroup) directly.
 Sequence:
   ready -> grasp_pre -> open gripper -> grasp_reach -> close gripper -> ready -> home
 
-Gripper is commanded by publishing std_msgs/Float64MultiArray on
-/gripper_controller/commands (JointGroupPositionController, not a MoveIt controller).
-The gripper_controller is configured with joints: [gripper_left_joint] only; the
-mimic joint (gripper_right_joint) is driven by the Gazebo physics mimic constraint.
-Hence we publish a single-element array [width].
+Gripper is commanded via control_msgs/action/GripperCommand on
+/gripper_controller/gripper_cmd (GripperActionController).
+gripper_right_joint is mirrored by the ros2_control native mimic mechanism.
 
 Usage:
   ros2 run jetank_manipulation grasp_server --ros-args -p use_sim_time:=true
@@ -27,6 +25,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
+from control_msgs.action import GripperCommand
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import (
     Constraints,
@@ -34,7 +33,6 @@ from moveit_msgs.msg import (
     MotionPlanRequest,
     PlanningOptions,
 )
-from std_msgs.msg import Float64MultiArray
 
 from jetank_manipulation.action import GraspObject
 
@@ -43,7 +41,7 @@ from jetank_manipulation.action import GraspObject
 # ---------------------------------------------------------------------------
 
 _MOVE_ACTION = "/move_action"
-_GRIPPER_CMD_TOPIC = "/gripper_controller/commands"
+_GRIPPER_ACTION = "/gripper_controller/gripper_cmd"
 
 ARM_GROUP = "arm"
 PLANNER_ID = "RRTConnect"
@@ -159,6 +157,7 @@ class GraspServer(Node):
         self.declare_parameter("motion.num_planning_attempts", 3)
         self.declare_parameter("gripper.open_width", 0.04)
         self.declare_parameter("gripper.close_width", 0.0)
+        self.declare_parameter("gripper.max_effort", 5.0)
         self.declare_parameter("gripper.dwell_after_open_s", 0.5)
         self.declare_parameter("gripper.dwell_after_close_s", 0.8)
         self.declare_parameter("arm_targets.approach", "ready")
@@ -177,11 +176,14 @@ class GraspServer(Node):
             callback_group=self._cb_group,
         )
 
-        # Gripper command publisher
-        self._gripper_pub = self.create_publisher(
-            Float64MultiArray,
-            _GRIPPER_CMD_TOPIC,
-            10,
+        # GripperCommand action client
+        # Replaces Float64MultiArray publisher — sends GripperCommand goals to
+        # GripperActionController at /gripper_controller/gripper_cmd.
+        self._gripper_client = ActionClient(
+            self,
+            GripperCommand,
+            _GRIPPER_ACTION,
+            callback_group=self._cb_group,
         )
 
         # GraspObject action server
@@ -224,6 +226,7 @@ class GraspServer(Node):
         num_attempts = int(self.get_parameter("motion.num_planning_attempts").value)
         open_width = float(self.get_parameter("gripper.open_width").value)
         close_width = float(self.get_parameter("gripper.close_width").value)
+        max_effort = float(self.get_parameter("gripper.max_effort").value)
         dwell_open = float(self.get_parameter("gripper.dwell_after_open_s").value)
         dwell_close = float(self.get_parameter("gripper.dwell_after_close_s").value)
 
@@ -238,12 +241,39 @@ class GraspServer(Node):
             goal_handle.publish_feedback(feedback_msg)
             self.get_logger().info(f"Stage: {stage}")
 
-        def command_gripper(width: float) -> None:
-            msg = Float64MultiArray()
-            # gripper_controller joints: [gripper_left_joint] only.
-            # gripper_right_joint is driven by the physics mimic constraint.
-            msg.data = [width]
-            self._gripper_pub.publish(msg)
+        async def command_gripper(width: float, effort: float) -> bool:
+            """Send a GripperCommand action goal. Returns True if the action
+            server accepted the goal and returned a result (stall or success).
+            Returns False if the action server is absent — caller degrades
+            gracefully and the grasp sequence continues.
+            """
+            if not self._gripper_client.wait_for_server(timeout_sec=5.0):
+                self.get_logger().warn(
+                    f"GripperCommand action server {_GRIPPER_ACTION} not available — "
+                    "skipping gripper command."
+                )
+                return False
+
+            gripper_goal = GripperCommand.Goal()
+            gripper_goal.command.position = width
+            gripper_goal.command.max_effort = effort
+
+            self.get_logger().info(
+                f"Sending GripperCommand: position={width:.4f} m, effort={effort:.1f} N"
+            )
+            send_future = await self._gripper_client.send_goal_async(gripper_goal)
+
+            if not send_future.accepted:
+                self.get_logger().error("GripperCommand goal rejected.")
+                return False
+
+            result_future = await send_future.get_result_async()
+            gripper_result = result_future.result
+            self.get_logger().info(
+                f"GripperCommand done: position={gripper_result.position:.4f}, "
+                f"stalled={gripper_result.stalled}, reached_goal={gripper_result.reached_goal}"
+            )
+            return True
 
         async def move_to(target_name: str) -> bool:
             """Plan and execute arm motion to a named SRDF target. Returns True on success."""
@@ -309,7 +339,7 @@ class GraspServer(Node):
 
         # Step 3: open gripper
         pub_feedback("opening_gripper")
-        command_gripper(open_width)
+        await command_gripper(open_width, max_effort)
         time.sleep(dwell_open)
 
         # Step 4: move to grasp
@@ -320,7 +350,7 @@ class GraspServer(Node):
 
         # Step 5: close gripper
         pub_feedback("closing_gripper")
-        command_gripper(close_width)
+        await command_gripper(close_width, max_effort)
         time.sleep(dwell_close)
 
         # Step 6: retreat to ready
