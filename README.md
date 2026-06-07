@@ -74,3 +74,29 @@ Named arm targets (`home`, `ready`, `grasp_pre`, `grasp_reach`) and their joint 
 ros2 run jetank_manipulation grasp_server --ros-args -p use_sim_time:=true
 ros2 action send_goal /grasp_object jetank_manipulation/action/GraspObject '{}'
 ```
+
+## Tests
+
+`test/test_import.py` loads the source `jetank_manipulation/grasp_server.py` by
+file path and exercises its pure logic. Heavy ROS deps (`rclpy`, `control_msgs`,
+`moveit_msgs`, the generated `jetank_manipulation.action.GraspObject`) are stubbed
+only when absent, so the suite runs in a bare env (no colcon build needed) and
+against the real packages alike. What it asserts:
+
+- `test_module_constants` — `ARM_GROUP`, `PLANNER_ID`, `_MOVE_ACTION`, `_GRIPPER_ACTION` hold their expected values.
+- `test_srdf_states_exact_values` / `test_every_state_has_four_dof` — `_SRDF_STATES` has exactly `home`/`ready`/`grasp_pre`/`grasp_reach`, each covering the 4 actuated joints with the values mirrored from `jetank.srdf`.
+- `test_config_yaml_named_targets_resolve` — every named target in `config/grasp_poses.yaml` exists in `_SRDF_STATES`.
+- `test_request_*` — `_named_target_request()` builds a `MotionPlanRequest` with the right top-level fields (group, planner, planning time, attempts, scaling, `world` frame), one constraint block named after the target, and one `JointConstraint` per DOF at the exact SRDF position with `±0.01` tolerance and weight `1.0`.
+- `test_scaling_factors_are_passed_through` — velocity/acceleration/time/attempt args reach the request unchanged.
+- `test_unknown_target_raises_value_error` — an unknown SRDF state name raises `ValueError`.
+
+Run the tests:
+
+```bash
+# standalone (bare env, deps stubbed)
+pixi run -- bash -c 'cd src/jetank_manipulation && python -m pytest test/ -q'
+
+# under colcon (ament_cmake_pytest); see results with the second command
+colcon test --packages-select jetank_manipulation
+colcon test-result --verbose
+```
