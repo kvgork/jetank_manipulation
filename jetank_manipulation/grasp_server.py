@@ -55,30 +55,13 @@ def _named_target_request(
     vel_scale: float,
     acc_scale: float,
 ) -> MotionPlanRequest:
-    """Build a MotionPlanRequest that moves *group_name* to *named_target*.
+    """Build a MotionPlanRequest moving *group_name* to a named SRDF target.
 
-    MoveIt2 resolves named targets from SRDF group_states at the move_group
-    side, so the client just needs to populate goal_constraints with a single
-    JointConstraint per DOF using the name from the SRDF.  However, the simpler
-    approach that move_group recognises is to set workspace_parameters.header
-    and embed the named target as a GoalConstraint; but MoveGroup action does
-    not expose a «named target» field directly.  We therefore use the
-    moveit_msgs MotionPlanRequest with the goal expressed as joint constraints
-    built from the known SRDF values, OR we use the «named_target» workaround
-    that move_group accepts via the pipeline_id field naming a shorthand goal.
-
-    The most robust approach without moveit_py is to set
-    ``workspace_parameters.header.frame_id = "world"`` and specify
-    ``goal_constraints`` as empty list but fill ``goal_constraints`` with a
-    single Constraints message whose ``name`` equals the SRDF state name.
-    MoveIt's OMPL pipeline reads named constraints from the SRDF when the
-    Constraints message has an empty joint_constraints list but a non-empty name
-    matching a group_state.
-
-    Actually, the clean path for named targets is: move_group's SetNamedJointTarget
-    is a ROS service, not part of the action goal. The action goal only accepts
-    explicit joint values or Cartesian poses. So we embed the known SRDF joint
-    values directly in the request. This keeps the node self-contained.
+    The MoveGroup action goal only accepts explicit joint values or Cartesian
+    poses (named-target resolution lives in a separate move_group service, not
+    the action). Without moveit_py we therefore embed the known SRDF joint
+    values (``_SRDF_STATES``) directly as per-DOF JointConstraints, keeping the
+    node self-contained.
     """
     req = MotionPlanRequest()
     req.group_name = group_name
@@ -124,21 +107,13 @@ _SRDF_STATES: dict = {
         "S3_joint": 1.047,
         "S5_joint": 0.0,
     },
-    # Tuned 2026-06-06 against sim (widened S3 +/-2.356) to reach as low in front
-    # as the arm allows: pre ~0.19 m, reach ~0.15 m above floor. The arm cannot
-    # touch the floor with the current URDF primitive link lengths — raise the
-    # target onto a low riser, or correct link lengths to real dims.
-    # LOWEST COLLISION-FREE forward reach (2026-06-06). The arm can kinematically
-    # reach ~0.06 m above the floor, but below ~0.10 m the wrist (S5_link) self-
-    # collides with the arm-mounted camera (camera_link) and move_group refuses
-    # to plan there. Lowest move_group-valid pose:
-    #   grasp_pre  S2=1.0 S3=0.0 -> x~0.225 z~0.152 (forward, raised)
-    #   grasp_reach S2=1.0 S3=1.0 -> x~0.147 z~0.105 (forward, ~0.08 m above floor)
-    # To go lower: resolve the S5_link<->camera_link collision (relocate camera or
-    # disable the pair if the primitive boxes are over-conservative).
-    # Set from RViz by the user 2026-06-06 (degrees -> rad):
+    # Forward grasp poses, tuned from RViz 2026-06-06 (degrees -> rad):
     #   grasp_reach: S2=100deg=1.745, S3=-15deg=-0.262
     #   grasp_pre:   derived raised approach (S2=70deg=1.222, same S3)
+    # The arm cannot touch the floor: below ~0.10 m the wrist (S5_link) self-
+    # collides with the arm-mounted camera (camera_link) and move_group refuses
+    # to plan. To go lower, resolve that collision (relocate camera or relax the
+    # pair) or correct the URDF primitive link lengths to real dims.
     "grasp_pre": {
         "S1_joint": 0.0,
         "S2_joint": 1.222,
@@ -257,10 +232,11 @@ class GraspServer(Node):
             self.get_logger().info(f"Stage: {stage}")
 
         async def command_gripper(width: float, effort: float) -> bool:
-            """Send a GripperCommand action goal. Returns True if the action
-            server accepted the goal and returned a result (stall or success).
-            Returns False if the action server is absent — caller degrades
-            gracefully and the grasp sequence continues.
+            """Send a GripperCommand action goal.
+
+            Returns True if the action server accepted the goal and returned a
+            result (stall or success); False if the server is absent — the
+            caller degrades gracefully and the grasp sequence continues.
             """
             if not self._gripper_client.wait_for_server(timeout_sec=5.0):
                 self.get_logger().warn(
@@ -333,11 +309,10 @@ class GraspServer(Node):
             if error_code == 1:
                 self.get_logger().info(f"Reached '{target_name}' (error_code=SUCCESS).")
                 return True
-            else:
-                self.get_logger().error(
-                    f"Motion to '{target_name}' failed (error_code={error_code})."
-                )
-                return False
+            self.get_logger().error(
+                f"Motion to '{target_name}' failed (error_code={error_code})."
+            )
+            return False
 
         # --- Grasp sequence ---
         # Step 1: move to approach (ready)
