@@ -32,6 +32,7 @@ Usage:
 """
 
 import math
+from copy import deepcopy
 from typing import Tuple
 
 import rclpy
@@ -39,6 +40,7 @@ from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.time import Time
 
 from geometry_msgs.msg import TwistStamped
 
@@ -146,6 +148,7 @@ class BaseApproachNode(Node):
         self.declare_parameter("max_ang", 0.8)
         self.declare_parameter("heading_tol", 0.15)
         self.declare_parameter("arrive_tol", 0.03)
+        self.declare_parameter("stable_frame", "odom")
         self.declare_parameter("control_rate", 10.0)
 
         self._cb_group = ReentrantCallbackGroup()
@@ -199,10 +202,21 @@ class BaseApproachNode(Node):
         timeout = float(goal.timeout)
         period = 1.0 / control_rate if control_rate > 0.0 else 0.1
 
+        stable_frame = self.get_parameter("stable_frame").value
+
         result = ApproachTarget.Result()
+
+        # Snapshot the target into a STABLE frame ONCE. The control loop then
+        # re-TFs stable->base each tick, so the distance shrinks as the base
+        # drives. Critical when the caller passes the target in base_frame
+        # (e.g. a sensed centroid): re-TFing base->base every tick is identity,
+        # so the target would stay a fixed distance ahead forever. Snapshotting
+        # into odom makes it a world-fixed point the base can actually reach.
+        loop_target = self._snapshot_target(goal.target, stable_frame, base_frame)
 
         self.get_logger().info(
             f"ApproachTarget: target frame='{goal.target.header.frame_id}' "
+            f"-> tracking in '{loop_target.header.frame_id}' "
             f"standoff={standoff:.3f} timeout={timeout:.1f}s -> base_frame='{base_frame}'."
         )
 
@@ -239,8 +253,8 @@ class BaseApproachNode(Node):
                     self.get_logger().warn(result.message)
                     return result
 
-                # TF the target into the base frame for this tick.
-                dx_dy = self._target_in_base(goal.target, base_frame)
+                # TF the (stable-frame) target into the base frame for this tick.
+                dx_dy = self._target_in_base(loop_target, base_frame)
                 if dx_dy is None:
                     # Transient TF gap: hold still, retry next tick.
                     self._stop()
@@ -290,6 +304,49 @@ class BaseApproachNode(Node):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _snapshot_target(self, target, stable_frame, base_frame):
+        """Transform *target* once into *stable_frame* (a world-fixed frame).
+
+        Returns a PointStamped in stable_frame. Falls back to the original target
+        if it is already in stable_frame, or if the TF is unavailable (then the
+        loop tracks it in its given frame — which only converges if that frame is
+        itself world-fixed, so a base-frame target would not; we warn in that case).
+        """
+        if not stable_frame or target.header.frame_id == stable_frame:
+            # Track at LATEST time: a world-fixed point looked up against the
+            # continuously-updated odom->base TF. Using the original detection
+            # stamp would age out of the TF buffer within seconds -> every tick
+            # fails "extrapolation into the past" and the servo never converges.
+            out = deepcopy(target)
+            out.header.stamp = Time().to_msg()
+            return out
+        try:
+            snap = self._tf_buffer.transform(
+                target, stable_frame,
+                timeout=rclpy.duration.Duration(seconds=0.5),
+            )
+            # Zero the stamp so per-tick lookups use the LATEST odom->base TF
+            # (the point is world-fixed in stable_frame; see note above).
+            snap.header.stamp = Time().to_msg()
+            self.get_logger().info(
+                f"Snapshotted target {target.header.frame_id} "
+                f"({target.point.x:.2f},{target.point.y:.2f}) -> {stable_frame}."
+            )
+            return snap
+        except TransformException as exc:
+            level = self.get_logger().warn
+            if target.header.frame_id == base_frame or not target.header.frame_id:
+                level(
+                    f"Cannot snapshot a {base_frame}-frame target into "
+                    f"'{stable_frame}' ({exc}); approach may NOT converge."
+                )
+            else:
+                level(
+                    f"Snapshot to '{stable_frame}' failed ({exc}); "
+                    f"tracking target in '{target.header.frame_id}'."
+                )
+            return target
 
     def _target_in_base(self, target, base_frame):
         """Return (dx, dy) of *target* in *base_frame*, or None on TF failure."""
