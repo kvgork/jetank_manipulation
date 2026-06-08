@@ -17,6 +17,7 @@ Usage:
   ros2 action send_goal /grasp_object jetank_manipulation/action/GraspObject '{}'
 """
 
+import math
 import time
 
 import rclpy
@@ -32,6 +33,7 @@ from moveit_msgs.msg import (
     Constraints,
     JointConstraint,
     MotionPlanRequest,
+    MoveItErrorCodes,
     OrientationConstraint,
     PlanningOptions,
     PositionConstraint,
@@ -68,6 +70,49 @@ _ORI_TOL_TIGHT = 3.14
 
 # Side length of the position-constraint tolerance box around the target point.
 _POSITION_BOX_SIZE_M = 0.02
+
+# Half-extent (m) of the workspace_parameters sampling box, centred on the target
+# point. move_group samples the position constraint inside this volume; a default
+# (zero) WorkspaceParameters box is degenerate and can break IK sampling, so we
+# give it a real, generously sized volume around the target.
+_WORKSPACE_HALF_EXTENT_M = 1.0
+
+
+def _moveit_error_name(val: int) -> str:
+    """Map a moveit_msgs/MoveItErrorCodes ``.val`` to its symbolic name.
+
+    Reflects the int constants off the generated ``MoveItErrorCodes`` message
+    (e.g. ``SUCCESS=1``, ``PLANNING_FAILED=-1``, ``NO_IK_SOLUTION=-31``,
+    ``FAILURE=99999`` aka the "Catastrophic failure"). This turns the bare
+    integer that move_group returns into a human-readable code so the TRUE error
+    is visible in the logs instead of an opaque number. Falls back to
+    ``"UNKNOWN"`` for codes not present in the installed message definition.
+    """
+    try:
+        for name, const in vars(MoveItErrorCodes).items():
+            if name.isupper() and isinstance(const, int) and const == val:
+                return name
+    except Exception:  # pragma: no cover - defensive against stub message types
+        pass
+    return "UNKNOWN"
+
+
+def _normalized_quaternion(q):
+    """Return (x, y, z, w) of *q* normalized to unit length.
+
+    move_group's orientation-constraint validator throws a *catastrophic*
+    failure (error_code 99999) on a non-unit — especially an all-zero
+    (0,0,0,0) — quaternion, which is the default for an unset
+    ``geometry_msgs/Quaternion``. We defensively normalize here and, when the
+    input is degenerate (norm ~ 0), fall back to the identity quaternion
+    ``(0, 0, 0, 1)`` so the request is never malformed. Returns the components
+    plus a bool flag indicating whether a fallback substitution happened.
+    """
+    norm = math.sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w)
+    if norm < 1e-6:
+        # Degenerate / unset quaternion -> identity (no rotation).
+        return (0.0, 0.0, 0.0, 1.0), True
+    return (q.x / norm, q.y / norm, q.z / norm, q.w / norm), False
 
 
 def _named_target_request(
@@ -124,9 +169,11 @@ def _pose_target_request(
     acc_scale: float,
     ee_link: str = EE_LINK,
     position_box_size: float = _POSITION_BOX_SIZE_M,
+    include_orientation: bool = False,
     ori_tol_x: float = _ORI_TOL_LOOSE,
     ori_tol_y: float = _ORI_TOL_LOOSE,
     ori_tol_z: float = _ORI_TOL_LOOSE,
+    logger=None,
 ) -> MotionPlanRequest:
     """Build a MotionPlanRequest moving *group_name*'s EE link to a Cartesian pose.
 
@@ -135,16 +182,29 @@ def _pose_target_request(
 
     * a ``PositionConstraint`` on *ee_link*: a small ``SolidPrimitive`` BOX
       (``position_box_size`` per side) centred on ``pose_stamped.pose.position``,
-      expressed in ``pose_stamped.header.frame_id``; and
-    * an ``OrientationConstraint`` on *ee_link* at ``pose_stamped.pose.orientation``
-      with **generous** absolute tolerances.
+      expressed in ``pose_stamped.header.frame_id`` — **always** included; and
+    * (only when ``include_orientation`` is True) an ``OrientationConstraint`` on
+      *ee_link* at the (normalized) ``pose_stamped.pose.orientation`` with
+      **generous** absolute tolerances.
 
-    The 4-DOF arm (S1/S2/S3/S5) cannot reach an arbitrary orientation, so the
-    orientation is a best-effort hint, not a rigid target: the loose tolerances
-    let IK/planning succeed while position stays tight. Effectively this requests
-    "reach this point, top-down-ish if you can".
+    Why orientation is OFF by default: the ``arm`` group is **4-DOF**
+    (S1/S2/S3/S5) and the SRDF uses the **KDL** IK solver. A 4-DOF arm cannot
+    satisfy a full 6-DOF pose (position + orientation); KDL IK throws on the
+    over-constrained problem, which surfaces as move_group's *"Catastrophic
+    failure"*. Sending position only lets IK/planning pick any wrist orientation
+    that reaches the point — which is all a 4-DOF arm can command anyway.
+    Orientation is therefore an opt-in best-effort hint (loose tolerances), not
+    a rigid target, enabled via ``include_orientation`` for a future, higher-DOF
+    arm or deliberate experimentation.
 
-    Note this does NOT mutate ``pose_stamped``; it is only read.
+    Robustness: when orientation IS included, the incoming quaternion is
+    normalized, and an unset / degenerate (near-zero) quaternion is replaced with
+    the identity quaternion. A non-unit (especially all-zero) quaternion is a
+    classic trigger for move_group's "Catastrophic failure", since the
+    orientation-constraint validator rejects it before any IK is attempted.
+
+    Note this does NOT mutate ``pose_stamped``; it is only read. An optional
+    *logger* (an rclpy logger) is used only for a one-line debug dump.
     """
     req = MotionPlanRequest()
     req.group_name = group_name
@@ -155,7 +215,23 @@ def _pose_target_request(
     req.max_acceleration_scaling_factor = acc_scale
 
     frame_id = pose_stamped.header.frame_id
+    px = pose_stamped.pose.position.x
+    py = pose_stamped.pose.position.y
+    pz = pose_stamped.pose.position.z
+
+    # Workspace must be a real (non-degenerate) volume: move_group samples the
+    # position constraint inside it. The default WorkspaceParameters is a
+    # zero-size box (min == max == origin) which can break IK sampling on the
+    # pose path. Centre a generous box on the target. (The named-target path
+    # never needs this because joint goals don't sample a workspace volume.)
     req.workspace_parameters.header.frame_id = frame_id
+    he = _WORKSPACE_HALF_EXTENT_M
+    req.workspace_parameters.min_corner.x = px - he
+    req.workspace_parameters.min_corner.y = py - he
+    req.workspace_parameters.min_corner.z = pz - he
+    req.workspace_parameters.max_corner.x = px + he
+    req.workspace_parameters.max_corner.y = py + he
+    req.workspace_parameters.max_corner.z = pz + he
 
     c = Constraints()
     c.name = "pose_target"
@@ -174,26 +250,64 @@ def _pose_target_request(
     bv.primitives.append(box)
     # The primitive_pose places the box centre at the target position. The
     # constrained point on the link is the link origin offset by
-    # target_point_offset (left zero -> the link origin itself).
+    # target_point_offset (left zero -> the link origin itself). The box pose
+    # itself must carry a valid unit quaternion (w=1) or move_group throws.
     primitive_pose = Pose()
-    primitive_pose.position.x = pose_stamped.pose.position.x
-    primitive_pose.position.y = pose_stamped.pose.position.y
-    primitive_pose.position.z = pose_stamped.pose.position.z
+    primitive_pose.position.x = px
+    primitive_pose.position.y = py
+    primitive_pose.position.z = pz
     primitive_pose.orientation.w = 1.0
     bv.primitive_poses.append(primitive_pose)
     pos_c.constraint_region = bv
     c.position_constraints.append(pos_c)
 
-    # --- Orientation: best-effort hint with generous tolerances ---
-    ori_c = OrientationConstraint()
-    ori_c.header.frame_id = frame_id
-    ori_c.link_name = ee_link
-    ori_c.orientation = pose_stamped.pose.orientation
-    ori_c.absolute_x_axis_tolerance = ori_tol_x
-    ori_c.absolute_y_axis_tolerance = ori_tol_y
-    ori_c.absolute_z_axis_tolerance = ori_tol_z
-    ori_c.weight = 0.5
-    c.orientation_constraints.append(ori_c)
+    # --- Orientation: OPT-IN best-effort hint with generous tolerances ---
+    # OFF by default: the 4-DOF arm + KDL IK cannot satisfy a full 6-DOF pose,
+    # and an orientation constraint on the over-constrained problem is the
+    # leading cause of move_group's "Catastrophic failure". When enabled, treat
+    # orientation as a loose hint, not a rigid target.
+    qx = qy = qz = qw = None
+    if include_orientation:
+        # Normalize (and identity-fallback) the target quaternion — a non-unit
+        # or all-zero quaternion is itself a catastrophic-failure trigger.
+        (qx, qy, qz, qw), fellback = _normalized_quaternion(
+            pose_stamped.pose.orientation
+        )
+        if fellback and logger is not None:
+            logger.warn(
+                "pose_target orientation quaternion was degenerate (near-zero "
+                "norm); substituted identity (0,0,0,1)."
+            )
+
+        ori_c = OrientationConstraint()
+        ori_c.header.frame_id = frame_id
+        ori_c.link_name = ee_link
+        ori_c.orientation.x = qx
+        ori_c.orientation.y = qy
+        ori_c.orientation.z = qz
+        ori_c.orientation.w = qw
+        ori_c.absolute_x_axis_tolerance = ori_tol_x
+        ori_c.absolute_y_axis_tolerance = ori_tol_y
+        ori_c.absolute_z_axis_tolerance = ori_tol_z
+        # Keep the default XYZ_EULER_ANGLES parameterization. ROTATION_VECTOR is
+        # not reliably supported across moveit_msgs builds and risks introducing
+        # a second catastrophic trigger; with the constraint only ever used with
+        # loose tolerances, the default decomposition is acceptable.
+        ori_c.weight = 0.5
+        c.orientation_constraints.append(ori_c)
+
+    if logger is not None:
+        ori_dump = (
+            f"({qx:.4f},{qy:.4f},{qz:.4f},{qw:.4f})"
+            if include_orientation
+            else "OFF (position-only)"
+        )
+        logger.debug(
+            f"pose_target req: frame='{frame_id}' link='{ee_link}' "
+            f"pos=({px:.3f},{py:.3f},{pz:.3f}) "
+            f"ori={ori_dump} "
+            f"primitives={len(bv.primitives)} primitive_poses={len(bv.primitive_poses)}"
+        )
 
     req.goal_constraints.append(c)
     return req
@@ -265,6 +379,13 @@ class GraspServer(Node):
         # Phase 7 pose-targeted grasp: default pre-grasp/retreat standoff (+Z, m)
         # above the target pose. Used when the goal's approach_height is <= 0.
         self.declare_parameter("pose_grasp.approach_height_m", 0.06)
+        # Whether the pose-targeted grasp constrains end-effector ORIENTATION.
+        # Default False: the 4-DOF arm + KDL IK cannot satisfy a full 6-DOF pose
+        # (position + orientation), and an orientation constraint is the leading
+        # cause of move_group's "Catastrophic failure". Position-only lets IK pick
+        # any reachable wrist orientation. Set True only for a higher-DOF arm or
+        # deliberate experimentation (then it is a loose best-effort hint).
+        self.declare_parameter("pose_grasp.pose_use_orientation", False)
 
         self._cb_group = ReentrantCallbackGroup()
 
@@ -348,13 +469,20 @@ class GraspServer(Node):
         result_future = await send_goal_future.get_result_async()
         motion_result = result_future.result
 
-        # moveit_msgs/MoveItErrorCodes: SUCCESS = 1
+        # Surface the REAL MoveItErrorCode. moveit_msgs/MoveItErrorCodes: SUCCESS=1.
+        # "Catastrophic failure" is the symbolic name for val == 99999, which is a
+        # genuine move_group code (not a grasp_server sentinel) and the symptom of
+        # KDL IK throwing on an over-constrained 6-DOF goal for the 4-DOF arm.
         error_code = motion_result.error_code.val
-        if error_code == 1:
-            self.get_logger().info(f"Reached '{label}' (error_code=SUCCESS).")
+        error_name = _moveit_error_name(error_code)
+        if error_code == 1:  # MoveItErrorCodes.SUCCESS
+            self.get_logger().info(
+                f"Reached '{label}' (error_code={error_code} {error_name})."
+            )
             return True
         self.get_logger().error(
-            f"Motion to '{label}' failed (error_code={error_code})."
+            f"Motion to '{label}' failed "
+            f"(error_code={error_code} {error_name})."
         )
         return False
 
@@ -380,6 +508,10 @@ class GraspServer(Node):
         t_grasp = self.get_parameter("arm_targets.grasp").value
         t_retreat = self.get_parameter("arm_targets.retreat").value
         t_park = self.get_parameter("arm_targets.park").value
+
+        pose_use_orientation = bool(
+            self.get_parameter("pose_grasp.pose_use_orientation").value
+        )
 
         def pub_feedback(stage: str):
             feedback_msg.stage = stage
@@ -450,6 +582,8 @@ class GraspServer(Node):
                 num_attempts,
                 vel_scale,
                 acc_scale,
+                include_orientation=pose_use_orientation,
+                logger=self.get_logger(),
             )
             return await self._execute_move_request(req, label)
 

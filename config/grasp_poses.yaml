@@ -30,5 +30,16 @@
       allowed_planning_time_s: 5.0  # seconds for OMPL to find a plan
       num_planning_attempts: 3      # retries per stage before aborting
 
+    # Pose-targeted grasp (Phase 7): when a GraspObject goal carries a target_pose,
+    # the EE link is driven to that Cartesian pose instead of the named presets.
+    pose_grasp:
+      approach_height_m: 0.06     # +Z standoff (m) for pre-grasp/retreat
+      # Constrain end-effector ORIENTATION as well as position?
+      # Keep FALSE: the 4-DOF arm (S1/S2/S3/S5) + KDL IK cannot satisfy a full
+      # 6-DOF pose, and an orientation constraint is the leading cause of
+      # move_group's "Catastrophic failure". Position-only lets IK pick any
+      # reachable wrist orientation. Enable only for a higher-DOF arm.
+      pose_use_orientation: false
+
     # Whether to use ROS sim time (set to true when running in Gazebo).
     use_sim_time: true

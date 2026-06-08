@@ -86,6 +86,14 @@ def _install_stubs():
         for sym in ("Constraints", "JointConstraint", "MotionPlanRequest",
                     "PlanningOptions"):
             mmm.__dict__[sym] = type(sym, (_Msg,), {})
+        # MoveItErrorCodes carries the symbolic int constants the error-name
+        # helper reflects over; mirror the ones grasp_server cares about.
+        mmm.MoveItErrorCodes = type(
+            "MoveItErrorCodes",
+            (),
+            {"SUCCESS": 1, "FAILURE": 99999, "PLANNING_FAILED": -1,
+             "NO_IK_SOLUTION": -31},
+        )
         mm.msg = mmm
 
     # ---- generated GraspObject action (needs a colcon build) ----
@@ -241,3 +249,220 @@ def test_scaling_factors_are_passed_through():
 def test_unknown_target_raises_value_error():
     with pytest.raises(ValueError):
         _build("definitely_not_a_state")
+
+
+# ---------------------------------------------------------------------------
+# _normalized_quaternion — pure helper (no ROS), always testable
+# ---------------------------------------------------------------------------
+
+class _Quat:
+    """Minimal duck-typed quaternion for the pure helper."""
+
+    def __init__(self, x, y, z, w):
+        self.x, self.y, self.z, self.w = x, y, z, w
+
+
+def test_normalized_quaternion_passes_through_unit():
+    # top-down quaternion (1,0,0,0) is already unit -> unchanged, no fallback.
+    (x, y, z, w), fellback = gs._normalized_quaternion(_Quat(1.0, 0.0, 0.0, 0.0))
+    assert (x, y, z, w) == pytest.approx((1.0, 0.0, 0.0, 0.0))
+    assert fellback is False
+
+
+def test_normalized_quaternion_normalizes_non_unit():
+    import math
+    (x, y, z, w), fellback = gs._normalized_quaternion(_Quat(0.0, 0.0, 0.0, 2.0))
+    assert fellback is False
+    n = math.sqrt(x * x + y * y + z * z + w * w)
+    assert n == pytest.approx(1.0)
+    assert (x, y, z, w) == pytest.approx((0.0, 0.0, 0.0, 1.0))
+
+
+def test_normalized_quaternion_zero_falls_back_to_identity():
+    # The catastrophic-failure trigger: an all-zero (unset) quaternion.
+    (x, y, z, w), fellback = gs._normalized_quaternion(_Quat(0.0, 0.0, 0.0, 0.0))
+    assert fellback is True
+    assert (x, y, z, w) == pytest.approx((0.0, 0.0, 0.0, 1.0))
+
+
+# ---------------------------------------------------------------------------
+# _moveit_error_name — turns the bare MoveItErrorCode int into a symbolic name
+# so the TRUE move_group error is visible in logs (not an opaque number).
+# ---------------------------------------------------------------------------
+
+def test_moveit_error_name_success():
+    assert gs._moveit_error_name(1) == "SUCCESS"
+
+
+def test_moveit_error_name_catastrophic_failure():
+    # 99999 is the genuine move_group "FAILURE" / Catastrophic-failure code.
+    assert gs._moveit_error_name(99999) == "FAILURE"
+
+
+def test_moveit_error_name_unknown_falls_back():
+    assert gs._moveit_error_name(-987654) == "UNKNOWN"
+
+
+# ---------------------------------------------------------------------------
+# _pose_target_request — the pose -> MotionPlanRequest builder
+#
+# Needs the REAL moveit_msgs / geometry_msgs / shape_msgs (a colcon build), so
+# it's skipped in a bare env. This is the regression guard for the move_group
+# "Catastrophic failure" (error_code 99999) that a malformed pose constraint or
+# a non-unit orientation quaternion triggers.
+# ---------------------------------------------------------------------------
+
+def _real_pose_msgs_available() -> bool:
+    import sys as _sys
+    # The bare-env stubs register fake modules in sys.modules; reject those —
+    # we only want the genuinely generated messages (they have a real __file__).
+    for mod in ("moveit_msgs.msg", "geometry_msgs.msg", "shape_msgs.msg"):
+        m = _sys.modules.get(mod)
+        if m is None:
+            try:
+                if importlib.util.find_spec(mod) is None:
+                    return False
+            except (ValueError, ModuleNotFoundError, ImportError):
+                return False
+            continue
+        # Already imported (possibly a stub): require a filesystem-backed module.
+        if getattr(m, "__file__", None) is None:
+            return False
+    try:
+        importlib.import_module("shape_msgs.msg")
+        importlib.import_module("geometry_msgs.msg")
+        importlib.import_module("moveit_msgs.msg")
+    except Exception:
+        return False
+    return True
+
+
+_HAVE_POSE_MSGS = _real_pose_msgs_available()
+
+pose_msgs = pytest.mark.skipif(
+    not _HAVE_POSE_MSGS,
+    reason="real moveit_msgs/geometry_msgs/shape_msgs unavailable (needs colcon build)",
+)
+
+
+def _make_pose_stamped(qx, qy, qz, qw, px=0.209, py=0.0, pz=0.036, frame="base_link"):
+    from geometry_msgs.msg import PoseStamped
+    ps = PoseStamped()
+    ps.header.frame_id = frame
+    ps.pose.position.x = px
+    ps.pose.position.y = py
+    ps.pose.position.z = pz
+    ps.pose.orientation.x = qx
+    ps.pose.orientation.y = qy
+    ps.pose.orientation.z = qz
+    ps.pose.orientation.w = qw
+    return ps
+
+
+def _build_pose_req(ps, include_orientation=False):
+    return gs._pose_target_request(
+        gs.ARM_GROUP, ps,
+        allowed_planning_time=5.0, num_attempts=3,
+        vel_scale=0.3, acc_scale=0.3,
+        include_orientation=include_orientation,
+    )
+
+
+@pose_msgs
+def test_pose_request_envelope_mirrors_named():
+    ps = _make_pose_stamped(1.0, 0.0, 0.0, 0.0)
+    req = _build_pose_req(ps)
+    assert req.group_name == "arm"
+    assert req.planner_id == "RRTConnect"
+    assert req.allowed_planning_time == pytest.approx(5.0)
+    assert req.num_planning_attempts == 3
+    assert req.workspace_parameters.header.frame_id == "base_link"
+    assert len(req.goal_constraints) == 1
+
+
+@pose_msgs
+def test_pose_request_position_constraint_populated():
+    """constraint_region must carry a BOX primitive AND a matching primitive_pose."""
+    ps = _make_pose_stamped(1.0, 0.0, 0.0, 0.0)
+    req = _build_pose_req(ps)
+    pc = req.goal_constraints[0].position_constraints
+    assert len(pc) == 1
+    region = pc[0].constraint_region
+    assert len(region.primitives) == 1
+    assert len(region.primitive_poses) == 1  # one pose per primitive
+    from shape_msgs.msg import SolidPrimitive
+    assert region.primitives[0].type == SolidPrimitive.BOX
+    assert len(region.primitives[0].dimensions) == 3
+    assert all(d > 0.0 for d in region.primitives[0].dimensions)
+    # The box pose itself must be a valid unit quaternion (w=1).
+    assert region.primitive_poses[0].orientation.w == pytest.approx(1.0)
+    assert pc[0].link_name == gs.EE_LINK
+    assert pc[0].header.frame_id == "base_link"
+    assert pc[0].weight > 0.0
+
+
+@pose_msgs
+def test_pose_request_workspace_is_non_degenerate():
+    """Workspace box must enclose a real volume (min < max on all axes)."""
+    ps = _make_pose_stamped(1.0, 0.0, 0.0, 0.0)
+    wp = _build_pose_req(ps).workspace_parameters
+    assert wp.min_corner.x < wp.max_corner.x
+    assert wp.min_corner.y < wp.max_corner.y
+    assert wp.min_corner.z < wp.max_corner.z
+
+
+@pose_msgs
+def test_pose_request_position_only_by_default():
+    """Default (pose_use_orientation=False): 1 position_constraint, 0 orientation.
+
+    The 4-DOF arm + KDL IK cannot satisfy a full 6-DOF pose; an orientation
+    constraint is the leading move_group "Catastrophic failure" cause, so the
+    pose grasp is position-only by default. This is the core regression guard.
+    """
+    for q in ((1.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0)):
+        block = _build_pose_req(_make_pose_stamped(*q)).goal_constraints[0]
+        assert len(block.position_constraints) == 1
+        assert len(block.orientation_constraints) == 0
+
+
+@pose_msgs
+def test_pose_request_with_orientation_has_one_of_each():
+    """With pose_use_orientation=True: exactly 1 position + 1 orientation constraint."""
+    block = _build_pose_req(
+        _make_pose_stamped(1.0, 0.0, 0.0, 0.0), include_orientation=True
+    ).goal_constraints[0]
+    assert len(block.position_constraints) == 1
+    assert len(block.orientation_constraints) == 1
+
+
+@pose_msgs
+def test_pose_request_orientation_is_unit_quaternion_when_enabled():
+    import math
+    ps = _make_pose_stamped(1.0, 0.0, 0.0, 0.0)
+    oc = _build_pose_req(ps, include_orientation=True).goal_constraints[0].orientation_constraints
+    assert len(oc) == 1
+    o = oc[0].orientation
+    n = math.sqrt(o.x ** 2 + o.y ** 2 + o.z ** 2 + o.w ** 2)
+    assert n == pytest.approx(1.0)
+    assert oc[0].link_name == gs.EE_LINK
+    assert oc[0].header.frame_id == "base_link"
+    assert oc[0].absolute_x_axis_tolerance > 0.0
+    assert oc[0].weight > 0.0
+
+
+@pose_msgs
+def test_pose_request_zero_quaternion_is_repaired_to_unit_when_enabled():
+    """The catastrophic-failure case: an all-zero orientation must not survive.
+
+    Only relevant when orientation is explicitly enabled; with it disabled
+    (the default) there is no orientation constraint to repair.
+    """
+    import math
+    ps = _make_pose_stamped(0.0, 0.0, 0.0, 0.0)  # unset / degenerate
+    oc = _build_pose_req(
+        ps, include_orientation=True
+    ).goal_constraints[0].orientation_constraints[0]
+    o = oc.orientation
+    n = math.sqrt(o.x ** 2 + o.y ** 2 + o.z ** 2 + o.w ** 2)
+    assert n == pytest.approx(1.0)  # identity, not the zero we passed in
+    assert (o.x, o.y, o.z, o.w) == pytest.approx((0.0, 0.0, 0.0, 1.0))
