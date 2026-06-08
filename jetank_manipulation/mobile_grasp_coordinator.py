@@ -82,6 +82,10 @@ class MobileGraspCoordinator(Node):
         self.declare_parameter("arm_reach", 0.22)
         self.declare_parameter("arm_base_xy", [0.06, 0.0])
         self.declare_parameter("approach_standoff", 0.18)
+        # 'preset' (default): grasp_server runs its tuned grasp_reach (validated for
+        # the 4-DOF arm; a Cartesian floor pose is infeasible — camera self-collision).
+        # 'pose': send the remembered world grasp pose (for elevated/reachable targets).
+        self.declare_parameter("grasp_mode", "preset")
         self.declare_parameter("target_frame", "base_link")
         # World-fixed frame used to remember the grasp pose across the drive.
         self.declare_parameter("world_frame", "odom")
@@ -211,29 +215,35 @@ class MobileGraspCoordinator(Node):
                 return self._fail(response, f"APPROACH: {msg}")
             self.get_logger().info(f"APPROACH: {msg}")
 
-        # ---- 4. GRASP (open-loop from the remembered world pose) --------
+        # ---- 4. GRASP --------------------------------------------------
         self._log_state("GRASP")
-        # The base has driven up and the fixed forward camera can no longer see
-        # the floor sock, so we do NOT re-segment. Instead transform the stored
-        # world-frame grasp pose back into base_link at the latest TF.
-        grasp_pose = self._from_world(self._grasp_pose_world, target_frame)
-        if grasp_pose is None:
-            return self._fail(
-                response,
-                f"GRASP: TF {world_frame}->{target_frame} unavailable; "
-                "cannot recover remembered grasp pose.",
+        grasp_mode = self.get_parameter("grasp_mode").value
+        if grasp_mode == "preset":
+            # Validated path for this 4-DOF arm: a free-form Cartesian grasp pose
+            # is infeasible at floor level (wrist self-collides with the arm-mounted
+            # camera -> OMPL cannot sample a valid IK state). The APPROACH step has
+            # centred the sock at the standoff, so we fire grasp_server's tuned
+            # PRESET reach (grasp_pre -> grasp_reach -> close), which plans as joint
+            # goals and is RViz-validated. No pose is sent.
+            self.get_logger().info("GRASP: preset reach (base centred the sock at standoff).")
+            ok, msg = self._grasp(None)
+        else:
+            # 'pose' mode (e.g. elevated/reachable targets): recover the remembered
+            # world-frame grasp pose into base_link and send it as target_pose.
+            grasp_pose = self._from_world(self._grasp_pose_world, target_frame)
+            if grasp_pose is None:
+                return self._fail(
+                    response,
+                    f"GRASP: TF {world_frame}->{target_frame} unavailable; "
+                    "cannot recover remembered grasp pose.",
+                )
+            gp = grasp_pose.pose.position
+            self.get_logger().info(
+                f"GRASP: recovered grasp pose in '{target_frame}' at "
+                f"({gp.x:.3f},{gp.y:.3f},{gp.z:.3f})."
             )
-        gx, gy, gz = (
-            grasp_pose.pose.position.x,
-            grasp_pose.pose.position.y,
-            grasp_pose.pose.position.z,
-        )
-        self.get_logger().info(
-            f"GRASP: recovered grasp pose in '{target_frame}' at "
-            f"({gx:.3f},{gy:.3f},{gz:.3f})."
-        )
-        self._pose_pub.publish(grasp_pose)
-        ok, msg = self._grasp(grasp_pose)
+            self._pose_pub.publish(grasp_pose)
+            ok, msg = self._grasp(grasp_pose)
         if not ok:
             return self._fail(response, f"GRASP: {msg}")
 
@@ -302,8 +312,12 @@ class MobileGraspCoordinator(Node):
             result.message or f"final_distance={result.final_distance:.3f}m"
         )
 
-    def _grasp(self, grasp_pose: PoseStamped):
-        """Call /grasp_object with a pose-targeted grasp; return (ok, message)."""
+    def _grasp(self, grasp_pose):
+        """Call /grasp_object; return (ok, message).
+
+        grasp_pose=None -> PRESET grasp (empty target_pose: grasp_server runs its
+        tuned grasp_pre/grasp_reach joint sequence). A PoseStamped -> pose-targeted.
+        """
         timeout_s = float(self.get_parameter("grasp_timeout_s").value)
         if not self._grasp_client.wait_for_server(timeout_sec=timeout_s):
             return False, (
@@ -312,7 +326,8 @@ class MobileGraspCoordinator(Node):
             )
 
         goal = GraspObject.Goal()
-        goal.target_pose = grasp_pose
+        if grasp_pose is not None:
+            goal.target_pose = grasp_pose  # pose mode; empty frame_id => preset
         goal.approach_height = 0.0  # let grasp_server use its default standoff
 
         result = self._send_and_wait(self._grasp_client, goal, timeout_s, "grasp")
