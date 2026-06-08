@@ -28,11 +28,16 @@ from rclpy.node import Node
 from control_msgs.action import GripperCommand
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import (
+    BoundingVolume,
     Constraints,
     JointConstraint,
     MotionPlanRequest,
+    OrientationConstraint,
     PlanningOptions,
+    PositionConstraint,
 )
+from geometry_msgs.msg import Pose, PoseStamped
+from shape_msgs.msg import SolidPrimitive
 
 from jetank_manipulation.action import GraspObject
 
@@ -45,6 +50,24 @@ _GRIPPER_ACTION = "/gripper_controller/gripper_cmd"
 
 ARM_GROUP = "arm"
 PLANNER_ID = "RRTConnect"
+
+# End-effector link of the 'arm' group (chain base_link -> S5_link). Pose-targeted
+# grasps constrain THIS link to the requested target pose.
+EE_LINK = "S5_link"
+
+# The 4-DOF arm (S1 yaw, S2/S3 pitch, S5 wrist) cannot achieve an arbitrary
+# end-effector orientation. We therefore treat the requested orientation as a
+# best-effort hint: position is constrained tightly, orientation loosely. These
+# generous tolerances (radians) let IK/planning find a solution on the axes the
+# arm cannot independently control. ~pi means "effectively unconstrained".
+_ORI_TOL_LOOSE = 3.14
+# The arm CAN control the approach (top-down) about base yaw fairly well, so we
+# leave the loose tolerance on all three axes by default; tighten via a tighter
+# value here only if a future, higher-DOF arm warrants it.
+_ORI_TOL_TIGHT = 3.14
+
+# Side length of the position-constraint tolerance box around the target point.
+_POSITION_BOX_SIZE_M = 0.02
 
 
 def _named_target_request(
@@ -88,6 +111,90 @@ def _named_target_request(
         jc.tolerance_below = 0.01
         jc.weight = 1.0
         c.joint_constraints.append(jc)
+    req.goal_constraints.append(c)
+    return req
+
+
+def _pose_target_request(
+    group_name: str,
+    pose_stamped: PoseStamped,
+    allowed_planning_time: float,
+    num_attempts: int,
+    vel_scale: float,
+    acc_scale: float,
+    ee_link: str = EE_LINK,
+    position_box_size: float = _POSITION_BOX_SIZE_M,
+    ori_tol_x: float = _ORI_TOL_LOOSE,
+    ori_tol_y: float = _ORI_TOL_LOOSE,
+    ori_tol_z: float = _ORI_TOL_LOOSE,
+) -> MotionPlanRequest:
+    """Build a MotionPlanRequest moving *group_name*'s EE link to a Cartesian pose.
+
+    Modular counterpart to ``_named_target_request`` for the Phase 7 pose-targeted
+    grasp path. The goal is a single ``Constraints`` block carrying:
+
+    * a ``PositionConstraint`` on *ee_link*: a small ``SolidPrimitive`` BOX
+      (``position_box_size`` per side) centred on ``pose_stamped.pose.position``,
+      expressed in ``pose_stamped.header.frame_id``; and
+    * an ``OrientationConstraint`` on *ee_link* at ``pose_stamped.pose.orientation``
+      with **generous** absolute tolerances.
+
+    The 4-DOF arm (S1/S2/S3/S5) cannot reach an arbitrary orientation, so the
+    orientation is a best-effort hint, not a rigid target: the loose tolerances
+    let IK/planning succeed while position stays tight. Effectively this requests
+    "reach this point, top-down-ish if you can".
+
+    Note this does NOT mutate ``pose_stamped``; it is only read.
+    """
+    req = MotionPlanRequest()
+    req.group_name = group_name
+    req.planner_id = PLANNER_ID
+    req.allowed_planning_time = allowed_planning_time
+    req.num_planning_attempts = num_attempts
+    req.max_velocity_scaling_factor = vel_scale
+    req.max_acceleration_scaling_factor = acc_scale
+
+    frame_id = pose_stamped.header.frame_id
+    req.workspace_parameters.header.frame_id = frame_id
+
+    c = Constraints()
+    c.name = "pose_target"
+
+    # --- Position: tight box around the target point on ee_link ---
+    pos_c = PositionConstraint()
+    pos_c.header.frame_id = frame_id
+    pos_c.link_name = ee_link
+    pos_c.weight = 1.0
+
+    box = SolidPrimitive()
+    box.type = SolidPrimitive.BOX
+    box.dimensions = [position_box_size, position_box_size, position_box_size]
+
+    bv = BoundingVolume()
+    bv.primitives.append(box)
+    # The primitive_pose places the box centre at the target position. The
+    # constrained point on the link is the link origin offset by
+    # target_point_offset (left zero -> the link origin itself).
+    primitive_pose = Pose()
+    primitive_pose.position.x = pose_stamped.pose.position.x
+    primitive_pose.position.y = pose_stamped.pose.position.y
+    primitive_pose.position.z = pose_stamped.pose.position.z
+    primitive_pose.orientation.w = 1.0
+    bv.primitive_poses.append(primitive_pose)
+    pos_c.constraint_region = bv
+    c.position_constraints.append(pos_c)
+
+    # --- Orientation: best-effort hint with generous tolerances ---
+    ori_c = OrientationConstraint()
+    ori_c.header.frame_id = frame_id
+    ori_c.link_name = ee_link
+    ori_c.orientation = pose_stamped.pose.orientation
+    ori_c.absolute_x_axis_tolerance = ori_tol_x
+    ori_c.absolute_y_axis_tolerance = ori_tol_y
+    ori_c.absolute_z_axis_tolerance = ori_tol_z
+    ori_c.weight = 0.5
+    c.orientation_constraints.append(ori_c)
+
     req.goal_constraints.append(c)
     return req
 
@@ -155,6 +262,9 @@ class GraspServer(Node):
         self.declare_parameter("arm_targets.grasp", "grasp_reach")
         self.declare_parameter("arm_targets.retreat", "ready")
         self.declare_parameter("arm_targets.park", "home")
+        # Phase 7 pose-targeted grasp: default pre-grasp/retreat standoff (+Z, m)
+        # above the target pose. Used when the goal's approach_height is <= 0.
+        self.declare_parameter("pose_grasp.approach_height_m", 0.06)
 
         self._cb_group = ReentrantCallbackGroup()
 
@@ -202,6 +312,51 @@ class GraspServer(Node):
     def _cancel_cb(self, goal_handle):
         self.get_logger().info("GraspObject cancel requested.")
         return CancelResponse.ACCEPT
+
+    # ------------------------------------------------------------------
+    # Shared MoveGroup plumbing (used by BOTH the preset and pose paths)
+    # ------------------------------------------------------------------
+
+    async def _execute_move_request(self, req: MotionPlanRequest, label: str) -> bool:
+        """Send a MotionPlanRequest via the MoveGroup action and wait for the result.
+
+        Reused by the legacy named-target path and the Phase 7 pose-target path so
+        the goal-send / result-wait / error-code handling lives in exactly one
+        place. Returns True iff move_group reports SUCCESS.
+        """
+        if not self._move_client.wait_for_server(timeout_sec=10.0):
+            self.get_logger().error(
+                f"MoveGroup action server {_MOVE_ACTION} not available."
+            )
+            return False
+
+        options = PlanningOptions()
+        options.plan_only = False
+        options.replan = False
+
+        goal_msg = MoveGroup.Goal()
+        goal_msg.request = req
+        goal_msg.planning_options = options
+
+        self.get_logger().info(f"Sending MoveGroup goal: -> {label}")
+        send_goal_future = await self._move_client.send_goal_async(goal_msg)
+
+        if not send_goal_future.accepted:
+            self.get_logger().error(f"MoveGroup goal to '{label}' was rejected.")
+            return False
+
+        result_future = await send_goal_future.get_result_async()
+        motion_result = result_future.result
+
+        # moveit_msgs/MoveItErrorCodes: SUCCESS = 1
+        error_code = motion_result.error_code.val
+        if error_code == 1:
+            self.get_logger().info(f"Reached '{label}' (error_code=SUCCESS).")
+            return True
+        self.get_logger().error(
+            f"Motion to '{label}' failed (error_code={error_code})."
+        )
+        return False
 
     async def _execute_cb(self, goal_handle):
         """Run the full grasp sequence asynchronously."""
@@ -268,11 +423,6 @@ class GraspServer(Node):
 
         async def move_to(target_name: str) -> bool:
             """Plan and execute arm motion to a named SRDF target. Returns True on success."""
-            if not self._move_client.wait_for_server(timeout_sec=10.0):
-                self.get_logger().error(
-                    f"MoveGroup action server {_MOVE_ACTION} not available."
-                )
-                return False
             try:
                 req = _named_target_request(
                     ARM_GROUP,
@@ -285,36 +435,52 @@ class GraspServer(Node):
             except ValueError as exc:
                 self.get_logger().error(str(exc))
                 return False
+            return await self._execute_move_request(req, target_name)
 
-            options = PlanningOptions()
-            options.plan_only = False
-            options.replan = False
+        async def move_to_pose(pose_stamped: PoseStamped, label: str) -> bool:
+            """Plan and execute arm motion so EE_LINK reaches *pose_stamped*.
 
-            goal_msg = MoveGroup.Goal()
-            goal_msg.request = req
-            goal_msg.planning_options = options
-
-            self.get_logger().info(f"Sending MoveGroup goal: -> {target_name}")
-            send_goal_future = await self._move_client.send_goal_async(goal_msg)
-
-            if not send_goal_future.accepted:
-                self.get_logger().error(f"MoveGroup goal to '{target_name}' was rejected.")
-                return False
-
-            result_future = await send_goal_future.get_result_async()
-            motion_result = result_future.result
-
-            # moveit_msgs/MoveItErrorCodes: SUCCESS = 1
-            error_code = motion_result.error_code.val
-            if error_code == 1:
-                self.get_logger().info(f"Reached '{target_name}' (error_code=SUCCESS).")
-                return True
-            self.get_logger().error(
-                f"Motion to '{target_name}' failed (error_code={error_code})."
+            Pose-targeted counterpart to ``move_to``; shares the same MoveGroup
+            send/wait plumbing via ``_execute_move_request``.
+            """
+            req = _pose_target_request(
+                ARM_GROUP,
+                pose_stamped,
+                plan_time,
+                num_attempts,
+                vel_scale,
+                acc_scale,
             )
-            return False
+            return await self._execute_move_request(req, label)
 
-        # --- Grasp sequence ---
+        # --- Branch: pose-targeted (Phase 7) vs legacy preset grasp ---
+        target_pose = goal_handle.request.target_pose
+        if target_pose.header.frame_id:
+            self.get_logger().info(
+                "GraspObject: pose-targeted grasp "
+                f"(frame='{target_pose.header.frame_id}')."
+            )
+            return await self._run_pose_grasp(
+                goal_handle,
+                result,
+                target_pose,
+                approach_height=self._resolve_approach_height(goal_handle),
+                t_approach=t_approach,
+                t_park=t_park,
+                open_width=open_width,
+                close_width=close_width,
+                max_effort=max_effort,
+                dwell_open=dwell_open,
+                dwell_close=dwell_close,
+                pub_feedback=pub_feedback,
+                command_gripper=command_gripper,
+                move_to=move_to,
+                move_to_pose=move_to_pose,
+            )
+
+        self.get_logger().info("GraspObject: legacy preset grasp (no target_pose).")
+
+        # --- Preset grasp sequence (legacy; unchanged behaviour) ---
         # Step 1: move to approach (ready)
         pub_feedback("moving_to_approach")
         if not await move_to(t_approach):
@@ -370,6 +536,112 @@ class GraspServer(Node):
         result.success = False
         result.message = "Motion failed; retreated to home."
         goal_handle.abort()
+
+    # ------------------------------------------------------------------
+    # Phase 7: pose-targeted grasp (modular, separate from the preset path)
+    # ------------------------------------------------------------------
+
+    def _resolve_approach_height(self, goal_handle) -> float:
+        """Pick the pre-grasp/retreat standoff (m): goal value if >0 else param default."""
+        goal_h = float(goal_handle.request.approach_height)
+        if goal_h > 0.0:
+            return goal_h
+        return float(self.get_parameter("pose_grasp.approach_height_m").value)
+
+    @staticmethod
+    def _offset_pose_z(pose_stamped: PoseStamped, dz: float) -> PoseStamped:
+        """Return a copy of *pose_stamped* raised by *dz* in +Z of its own frame.
+
+        Does not mutate the input. Orientation, frame_id, and stamp are preserved.
+        """
+        out = PoseStamped()
+        out.header.frame_id = pose_stamped.header.frame_id
+        out.header.stamp = pose_stamped.header.stamp
+        out.pose.position.x = pose_stamped.pose.position.x
+        out.pose.position.y = pose_stamped.pose.position.y
+        out.pose.position.z = pose_stamped.pose.position.z + dz
+        out.pose.orientation = pose_stamped.pose.orientation
+        return out
+
+    async def _run_pose_grasp(
+        self,
+        goal_handle,
+        result,
+        target_pose: PoseStamped,
+        approach_height: float,
+        t_approach: str,
+        t_park: str,
+        open_width: float,
+        close_width: float,
+        max_effort: float,
+        dwell_open: float,
+        dwell_close: float,
+        pub_feedback,
+        command_gripper,
+        move_to,
+        move_to_pose,
+    ):
+        """Pose-targeted grasp sequence.
+
+        ready (preset) -> pre_grasp (target + approach_height +Z) -> open gripper
+        -> reach (target) -> close gripper -> retreat (back to pre_grasp) -> home.
+
+        Position is constrained tightly; orientation is a best-effort top-down-ish
+        hint (loose tolerances) because the arm is 4-DOF. Reuses the same gripper
+        and MoveGroup plumbing as the preset path.
+        """
+        pre_grasp_pose = self._offset_pose_z(target_pose, approach_height)
+        self.get_logger().info(
+            f"Pose grasp: approach_height={approach_height:.3f} m, "
+            f"target z={target_pose.pose.position.z:.3f} m -> "
+            f"pre-grasp z={pre_grasp_pose.pose.position.z:.3f} m."
+        )
+
+        # Step 1: move to approach (preset 'ready' — known-safe starting pose)
+        pub_feedback("moving_to_approach")
+        if not await move_to(t_approach):
+            await self._abort_and_retreat(goal_handle, result, move_to, t_park)
+            return result
+
+        # Step 2: pre-grasp (target pose raised by approach_height)
+        pub_feedback("pre_grasp")
+        if not await move_to_pose(pre_grasp_pose, "pre_grasp"):
+            await self._abort_and_retreat(goal_handle, result, move_to, t_park)
+            return result
+
+        # Step 3: open gripper
+        pub_feedback("opening_gripper")
+        await command_gripper(open_width, max_effort)
+        time.sleep(dwell_open)
+
+        # Step 4: reach (the target pose itself)
+        pub_feedback("reach")
+        if not await move_to_pose(target_pose, "reach"):
+            await self._abort_and_retreat(goal_handle, result, move_to, t_park)
+            return result
+
+        # Step 5: close gripper
+        pub_feedback("close")
+        await command_gripper(close_width, max_effort)
+        time.sleep(dwell_close)
+
+        # Step 6: retreat (back up to the pre-grasp standoff)
+        pub_feedback("retreat")
+        if not await move_to_pose(pre_grasp_pose, "retreat"):
+            self.get_logger().warn(
+                "Pose-grasp retreat failed; attempting park at home."
+            )
+
+        # Step 7: park at home (preset)
+        pub_feedback("parking")
+        await move_to(t_park)
+
+        pub_feedback("done")
+        result.success = True
+        result.message = "Pose-targeted grasp sequence completed successfully."
+        goal_handle.succeed()
+        self.get_logger().info("GraspObject (pose): SUCCESS")
+        return result
 
 
 # ---------------------------------------------------------------------------

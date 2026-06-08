@@ -1,5 +1,15 @@
 # Goal
 string object_hint   # unused in Phase 1 (open-loop preset grasp); reserved for Phase 2 vision-targeted grasp
+
+# Phase 7: pose-targeted grasp.
+# If target_pose.header.frame_id is non-empty, grasp_server plans the 'arm'
+# group so S5_link/gripper_ee reaches this pose (position + best-effort
+# top-down yaw). If empty, the legacy preset (SRDF named-target) grasp runs.
+geometry_msgs/PoseStamped target_pose
+
+# Meters above target_pose used for the pre-grasp / retreat standoff (+Z in the
+# target frame). 0 or negative -> grasp_server falls back to its default param.
+float32 approach_height
 ---
 # Result
 bool success

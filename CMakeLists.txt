@@ -10,6 +10,7 @@ find_package(ament_cmake_python REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(builtin_interfaces REQUIRED)
+find_package(geometry_msgs REQUIRED)
 # Runtime dependency of grasp_pose_node (pure-python node); declaring it here
 # makes the build-time ordering explicit so colcon builds jetank_detection's
 # generated interfaces before this package.
@@ -22,7 +23,7 @@ find_package(jetank_detection REQUIRED)
 # Instead, install the source Python package files directly.
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/GraspObject.action"
-  DEPENDENCIES std_msgs builtin_interfaces
+  DEPENDENCIES std_msgs builtin_interfaces geometry_msgs
 )
 
 # Install source Python package alongside the generated bindings.
