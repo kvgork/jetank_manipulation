@@ -74,6 +74,7 @@ def approach_control(
     k_ang: float,
     max_lin: float,
     max_ang: float,
+    arrive_tol: float = 0.03,
 ) -> Tuple[float, float, bool]:
     """Rotate-then-drive diff-drive servo toward a target in the base frame.
 
@@ -105,8 +106,11 @@ def approach_control(
     dist = math.hypot(dx, dy)
     heading = math.atan2(dy, dx)
 
-    # Arrived: within standoff -> full stop.
-    if dist <= standoff:
+    # Arrived: within standoff (+ tolerance) -> full stop. The forward term
+    # k_lin*(dist-standoff) decays to ~0 as dist approaches standoff, so the base
+    # asymptotes to the standoff from above and never crosses `dist <= standoff`
+    # exactly — the tolerance band is what actually trips arrival.
+    if dist <= standoff + arrive_tol:
         return 0.0, 0.0, True
 
     # Always servo heading.
@@ -141,6 +145,7 @@ class BaseApproachNode(Node):
         self.declare_parameter("max_lin", 0.15)
         self.declare_parameter("max_ang", 0.8)
         self.declare_parameter("heading_tol", 0.15)
+        self.declare_parameter("arrive_tol", 0.03)
         self.declare_parameter("control_rate", 10.0)
 
         self._cb_group = ReentrantCallbackGroup()
@@ -187,6 +192,7 @@ class BaseApproachNode(Node):
         max_lin = float(self.get_parameter("max_lin").value)
         max_ang = float(self.get_parameter("max_ang").value)
         heading_tol = float(self.get_parameter("heading_tol").value)
+        arrive_tol = float(self.get_parameter("arrive_tol").value)
         control_rate = float(self.get_parameter("control_rate").value)
 
         standoff = float(goal.standoff)
@@ -245,6 +251,7 @@ class BaseApproachNode(Node):
                 lin, ang, arrived = approach_control(
                     dx, dy, standoff, heading_tol,
                     k_lin, k_ang, max_lin, max_ang,
+                    arrive_tol=arrive_tol,
                 )
                 last_dist = math.hypot(dx, dy)
                 heading = math.atan2(dy, dx)
