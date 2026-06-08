@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""Mobile-manipulation grasp coordinator for the JeTank (Phase 7).
+
+A *thin* state machine that ORCHESTRATES the existing modular pieces purely via
+their ROS interfaces — it owns no perception, motion or driving logic of its own.
+Triggered by ``~/execute_sock_grasp`` (``std_srvs/srv/Trigger``); on trigger it
+runs:
+
+  1. SEGMENT      ActionClient /segment_socks (jetank_detection/SegmentSocks)
+                  with target_frame = ``target_frame`` (param). No sock -> fail.
+  2. REACH_CHECK  Is the sock centroid within the arm's reachable envelope
+                  (``arm_reach`` about ``arm_base_xy``)? If yes, skip APPROACH.
+  3. APPROACH     ActionClient /approach_target (jetank_manipulation/ApproachTarget)
+                  with target = the sock centroid, standoff = ``approach_standoff``.
+                  (only when not already reachable.)
+  4. RE_SEGMENT   /segment_socks again (sock now near) for a fresh grasp.
+  5. GRASP        ActionClient /grasp_object (jetank_manipulation/GraspObject) with
+                  a top-down PoseStamped at the (re-segmented) sock centroid.
+  6. DONE / FAILED  Report via the Trigger response.
+
+Any missing server / timeout / rejection at any step yields a *graceful*
+``Trigger`` response with ``success=false`` and a clear message — the coordinator
+never raises into the service.
+
+Uses ActionClients on a ReentrantCallbackGroup under a MultiThreadedExecutor (the
+same idiom as ``grasp_pose_node.py``): each sub-call sends the goal then spins the
+executor until the future resolves or a per-step timeout elapses.
+
+Usage:
+  ros2 run jetank_manipulation mobile_grasp_coordinator --ros-args -p use_sim_time:=true
+  ros2 service call /mobile_grasp_coordinator/execute_sock_grasp std_srvs/srv/Trigger '{}'
+"""
+
+import math
+
+import rclpy
+from rclpy.action import ActionClient
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
+
+from std_srvs.srv import Trigger
+from geometry_msgs.msg import PointStamped, PoseStamped, Quaternion
+
+from jetank_detection.action import SegmentSocks
+from jetank_manipulation.action import ApproachTarget, GraspObject
+
+# Reuse the top-down grasp orientation math from grasp_pose_node (DRY within
+# the package). top_down_quaternion(yaw) -> (x, y, z, w) with the tool +Z
+# pointing down (roll = pi) and yaw spun about the vertical approach axis.
+from jetank_manipulation.grasp_pose_node import top_down_quaternion
+
+
+class MobileGraspCoordinator(Node):
+    """Trigger -> SEGMENT -> REACH_CHECK -> [APPROACH -> RE_SEGMENT] -> GRASP."""
+
+    def __init__(self) -> None:
+        super().__init__("mobile_grasp_coordinator")
+
+        self.declare_parameter("min_score", 0.3)
+        self.declare_parameter("max_range", 3.0)
+        self.declare_parameter("arm_reach", 0.22)
+        self.declare_parameter("arm_base_xy", [0.06, 0.0])
+        self.declare_parameter("approach_standoff", 0.18)
+        self.declare_parameter("target_frame", "base_link")
+        self.declare_parameter("segment_action", "/segment_socks")
+        self.declare_parameter("approach_action", "/approach_target")
+        self.declare_parameter("grasp_action", "/grasp_object")
+        # Per-step timeouts (s).
+        self.declare_parameter("segment_timeout_s", 10.0)
+        self.declare_parameter("approach_timeout_s", 30.0)
+        self.declare_parameter("grasp_timeout_s", 60.0)
+
+        self._cb_group = ReentrantCallbackGroup()
+
+        self._seg_client = ActionClient(
+            self, SegmentSocks,
+            self.get_parameter("segment_action").value,
+            callback_group=self._cb_group,
+        )
+        self._approach_client = ActionClient(
+            self, ApproachTarget,
+            self.get_parameter("approach_action").value,
+            callback_group=self._cb_group,
+        )
+        self._grasp_client = ActionClient(
+            self, GraspObject,
+            self.get_parameter("grasp_action").value,
+            callback_group=self._cb_group,
+        )
+
+        # Latched grasp pose for RViz (optional output).
+        latched_qos = QoSProfile(
+            depth=1,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self._pose_pub = self.create_publisher(
+            PoseStamped, "~/grasp_pose", latched_qos
+        )
+
+        self._srv = self.create_service(
+            Trigger,
+            "~/execute_sock_grasp",
+            self._on_trigger,
+            callback_group=self._cb_group,
+        )
+
+        self.get_logger().info(
+            "mobile_grasp_coordinator ready. Trigger ~/execute_sock_grasp."
+        )
+
+    # ------------------------------------------------------------------
+    # Service callback (the state machine)
+    # ------------------------------------------------------------------
+
+    def _on_trigger(self, _request, response):
+        target_frame = self.get_parameter("target_frame").value
+        arm_reach = float(self.get_parameter("arm_reach").value)
+        arm_base = list(self.get_parameter("arm_base_xy").value)
+        ax = float(arm_base[0]) if len(arm_base) > 0 else 0.06
+        ay = float(arm_base[1]) if len(arm_base) > 1 else 0.0
+        approach_standoff = float(self.get_parameter("approach_standoff").value)
+
+        # ---- 1. SEGMENT -------------------------------------------------
+        self._log_state("SEGMENT")
+        sock = self._segment(target_frame)
+        if sock is None:
+            return self._fail(response, "SEGMENT: no sock found / segmentation unavailable.")
+
+        cx, cy, cz = (
+            sock.centroid.point.x,
+            sock.centroid.point.y,
+            sock.centroid.point.z,
+        )
+        self.get_logger().info(
+            f"SEGMENT: sock '{sock.label}' score={sock.score:.2f} "
+            f"centroid=({cx:.3f},{cy:.3f},{cz:.3f}) in {target_frame}."
+        )
+
+        # ---- 2. REACH_CHECK --------------------------------------------
+        self._log_state("REACH_CHECK")
+        horiz = math.hypot(cx - ax, cy - ay)
+        reachable = horiz <= arm_reach
+        self.get_logger().info(
+            f"REACH_CHECK: horizontal distance from arm mount ({ax:.3f},{ay:.3f}) "
+            f"= {horiz:.3f}m, arm_reach={arm_reach:.3f}m -> "
+            f"{'reachable (skip APPROACH)' if reachable else 'out of reach'}."
+        )
+
+        # ---- 3. APPROACH (conditional) ---------------------------------
+        if not reachable:
+            self._log_state("APPROACH")
+            ok, msg = self._approach((cx, cy, cz), sock.centroid.header.frame_id,
+                                     approach_standoff)
+            if not ok:
+                return self._fail(response, f"APPROACH: {msg}")
+            self.get_logger().info(f"APPROACH: {msg}")
+
+            # ---- 4. RE_SEGMENT -----------------------------------------
+            self._log_state("RE_SEGMENT")
+            sock = self._segment(target_frame)
+            if sock is None:
+                return self._fail(
+                    response,
+                    "RE_SEGMENT: no sock found after approach (moved out of view?).",
+                )
+            cx, cy, cz = (
+                sock.centroid.point.x,
+                sock.centroid.point.y,
+                sock.centroid.point.z,
+            )
+            self.get_logger().info(
+                f"RE_SEGMENT: sock '{sock.label}' centroid="
+                f"({cx:.3f},{cy:.3f},{cz:.3f}) in {target_frame}."
+            )
+
+        # ---- 5. GRASP ---------------------------------------------------
+        self._log_state("GRASP")
+        grasp_pose = self._make_grasp_pose(target_frame, cx, cy, cz)
+        self._pose_pub.publish(grasp_pose)
+        ok, msg = self._grasp(grasp_pose)
+        if not ok:
+            return self._fail(response, f"GRASP: {msg}")
+
+        # ---- 6. DONE ----------------------------------------------------
+        self._log_state("DONE")
+        response.success = True
+        response.message = (
+            f"Sock grasp complete. {'approached then ' if not reachable else ''}"
+            f"grasped at ({cx:.3f},{cy:.3f},{cz:.3f}) in {target_frame}. {msg}"
+        )
+        self.get_logger().info(response.message)
+        return response
+
+    # ------------------------------------------------------------------
+    # Per-step orchestration helpers (each returns gracefully on failure)
+    # ------------------------------------------------------------------
+
+    def _segment(self, target_frame):
+        """Call /segment_socks once; return the SockCloud or None on any failure."""
+        timeout_s = float(self.get_parameter("segment_timeout_s").value)
+        if not self._seg_client.wait_for_server(timeout_sec=timeout_s):
+            self.get_logger().warn(
+                f"Segmentation server '{self.get_parameter('segment_action').value}' "
+                "not available."
+            )
+            return None
+
+        goal = SegmentSocks.Goal()
+        goal.target_frame = target_frame
+        goal.min_score = float(self.get_parameter("min_score").value)
+        goal.max_range = float(self.get_parameter("max_range").value)
+        goal.publish_debug = False
+
+        result = self._send_and_wait(self._seg_client, goal, timeout_s, "segment")
+        if result is None:
+            return None
+        if not result.found:
+            self.get_logger().info("Segmentation returned found=false.")
+            return None
+        return result.sock
+
+    def _approach(self, centroid_xyz, frame_id, standoff):
+        """Call /approach_target; return (ok, message)."""
+        timeout_s = float(self.get_parameter("approach_timeout_s").value)
+        if not self._approach_client.wait_for_server(timeout_sec=timeout_s):
+            return False, (
+                f"approach server '{self.get_parameter('approach_action').value}' "
+                "not available."
+            )
+
+        goal = ApproachTarget.Goal()
+        pt = PointStamped()
+        pt.header.frame_id = frame_id or self.get_parameter("target_frame").value
+        pt.header.stamp = self.get_clock().now().to_msg()
+        pt.point.x, pt.point.y, pt.point.z = (
+            float(centroid_xyz[0]), float(centroid_xyz[1]), float(centroid_xyz[2]),
+        )
+        goal.target = pt
+        goal.standoff = float(standoff)
+        goal.timeout = timeout_s
+
+        result = self._send_and_wait(self._approach_client, goal, timeout_s, "approach")
+        if result is None:
+            return False, "approach goal rejected or timed out."
+        return bool(result.success), (
+            result.message or f"final_distance={result.final_distance:.3f}m"
+        )
+
+    def _grasp(self, grasp_pose: PoseStamped):
+        """Call /grasp_object with a pose-targeted grasp; return (ok, message)."""
+        timeout_s = float(self.get_parameter("grasp_timeout_s").value)
+        if not self._grasp_client.wait_for_server(timeout_sec=timeout_s):
+            return False, (
+                f"grasp server '{self.get_parameter('grasp_action').value}' "
+                "not available."
+            )
+
+        goal = GraspObject.Goal()
+        goal.target_pose = grasp_pose
+        goal.approach_height = 0.0  # let grasp_server use its default standoff
+
+        result = self._send_and_wait(self._grasp_client, goal, timeout_s, "grasp")
+        if result is None:
+            return False, "grasp goal rejected or timed out."
+        return bool(result.success), result.message or ""
+
+    def _make_grasp_pose(self, frame_id, cx, cy, cz) -> PoseStamped:
+        """Top-down PoseStamped at the sock centroid (yaw 0 -> pure roll-pi)."""
+        quat = top_down_quaternion(0.0)
+        pose = PoseStamped()
+        pose.header.frame_id = frame_id
+        pose.header.stamp = self.get_clock().now().to_msg()
+        pose.pose.position.x = float(cx)
+        pose.pose.position.y = float(cy)
+        pose.pose.position.z = float(cz)
+        pose.pose.orientation = Quaternion(
+            x=quat[0], y=quat[1], z=quat[2], w=quat[3]
+        )
+        return pose
+
+    # ------------------------------------------------------------------
+    # Generic action send/wait (mirrors grasp_pose_node._call_segment)
+    # ------------------------------------------------------------------
+
+    def _send_and_wait(self, client, goal, timeout_s, label):
+        """Send *goal* on *client*, spin until result/timeout. Returns Result or None."""
+        send_future = client.send_goal_async(goal)
+        if not self._spin_until(send_future, timeout_s):
+            self.get_logger().warn(f"{label}: timed out waiting for goal acceptance.")
+            return None
+
+        goal_handle = send_future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            self.get_logger().warn(f"{label}: goal was rejected.")
+            return None
+
+        result_future = goal_handle.get_result_async()
+        if not self._spin_until(result_future, timeout_s):
+            self.get_logger().warn(f"{label}: timed out waiting for result.")
+            return None
+
+        wrapped = result_future.result()
+        return wrapped.result if wrapped is not None else None
+
+    def _spin_until(self, future, timeout_s: float) -> bool:
+        """Block until *future* completes or *timeout_s* elapses (executor spins)."""
+        import time
+
+        deadline = self.get_clock().now().nanoseconds + int(timeout_s * 1e9)
+        while rclpy.ok() and not future.done():
+            if self.get_clock().now().nanoseconds > deadline:
+                return False
+            time.sleep(0.02)
+        return future.done()
+
+    # ------------------------------------------------------------------
+    # Small utilities
+    # ------------------------------------------------------------------
+
+    def _log_state(self, state: str) -> None:
+        self.get_logger().info(f"[state] -> {state}")
+
+    def _fail(self, response, message: str):
+        self._log_state("FAILED")
+        response.success = False
+        response.message = message
+        self.get_logger().warn(message)
+        return response
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = MobileGraspCoordinator()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()

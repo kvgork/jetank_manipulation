@@ -23,6 +23,7 @@ find_package(jetank_detection REQUIRED)
 # Instead, install the source Python package files directly.
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/GraspObject.action"
+  "action/ApproachTarget.action"
   DEPENDENCIES std_msgs builtin_interfaces geometry_msgs
 )
 
@@ -50,6 +51,22 @@ install(PROGRAMS
   RENAME grasp_pose_node
 )
 
+# Install the base-approach action server:
+#   ros2 run jetank_manipulation base_approach_node
+install(PROGRAMS
+  jetank_manipulation/base_approach_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME base_approach_node
+)
+
+# Install the mobile-grasp coordinator:
+#   ros2 run jetank_manipulation mobile_grasp_coordinator
+install(PROGRAMS
+  jetank_manipulation/mobile_grasp_coordinator.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME mobile_grasp_coordinator
+)
+
 # Install launch and config directories
 foreach(_dir launch config)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_dir}")
@@ -68,6 +85,7 @@ if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_pytest_test(test_import test/test_import.py)
   ament_add_pytest_test(test_grasp_pose test/test_grasp_pose.py)
+  ament_add_pytest_test(test_base_control test/test_base_control.py)
 endif()
 
 ament_package()

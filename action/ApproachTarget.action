@@ -1,0 +1,13 @@
+# Goal
+geometry_msgs/PointStamped target   # point to approach (any frame; will be looked up in base frame)
+float32 standoff                    # stop when target is this far ahead (m), e.g. 0.18
+float32 timeout                     # s, abort if exceeded
+---
+# Result
+bool success
+float32 final_distance
+string message
+---
+# Feedback
+float32 distance
+float32 heading_error

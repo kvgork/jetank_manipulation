@@ -89,7 +89,20 @@ def _install_stubs():
         mm.msg = mmm
 
     # ---- generated GraspObject action (needs a colcon build) ----
-    if importlib.util.find_spec("jetank_manipulation.action") is None:
+    # jetank_manipulation may resolve to the source tree (no generated `action`
+    # subpackage) while the install overlay carries the real one — find_spec can
+    # then raise ValueError (action.__spec__ is None) instead of returning None.
+    # Guard it and only stub when the real generated action is unimportable.
+    try:
+        _have_action = importlib.util.find_spec("jetank_manipulation.action") is not None
+    except (ValueError, ModuleNotFoundError, ImportError):
+        _have_action = False
+    if _have_action:
+        try:
+            importlib.import_module("jetank_manipulation.action")
+        except Exception:
+            _have_action = False
+    if not _have_action:
         # Reuse the real jetank_manipulation package object if importable so we
         # don't shadow it; otherwise create a bare stub package.
         if "jetank_manipulation" not in sys.modules:
