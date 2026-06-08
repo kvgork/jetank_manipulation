@@ -10,6 +10,10 @@ find_package(ament_cmake_python REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(builtin_interfaces REQUIRED)
+# Runtime dependency of grasp_pose_node (pure-python node); declaring it here
+# makes the build-time ordering explicit so colcon builds jetank_detection's
+# generated interfaces before this package.
+find_package(jetank_detection REQUIRED)
 
 # Generate the GraspObject action interface.
 # NOTE: rosidl_generate_interfaces internally installs generated Python bindings
@@ -37,6 +41,14 @@ install(PROGRAMS
   RENAME grasp_server
 )
 
+# Install the grasp pose planner executable:
+#   ros2 run jetank_manipulation grasp_pose_node
+install(PROGRAMS
+  jetank_manipulation/grasp_pose_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME grasp_pose_node
+)
+
 # Install launch and config directories
 foreach(_dir launch config)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_dir}")
@@ -54,6 +66,7 @@ if(BUILD_TESTING)
 
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_pytest_test(test_import test/test_import.py)
+  ament_add_pytest_test(test_grasp_pose test/test_grasp_pose.py)
 endif()
 
 ament_package()
