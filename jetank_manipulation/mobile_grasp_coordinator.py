@@ -8,19 +8,27 @@ runs:
 
   1. SEGMENT      ActionClient /segment_socks (jetank_detection/SegmentSocks)
                   with target_frame = ``target_frame`` (param). No sock -> fail.
+                  On success, build the top-down grasp PoseStamped in
+                  ``target_frame`` (base_link) and transform it into the
+                  world-fixed ``world_frame`` (param, default ``odom``); the
+                  stored odom-frame pose is the grasp target captured while the
+                  sock is still in view.
   2. REACH_CHECK  Is the sock centroid within the arm's reachable envelope
                   (``arm_reach`` about ``arm_base_xy``)? If yes, skip APPROACH.
   3. APPROACH     ActionClient /approach_target (jetank_manipulation/ApproachTarget)
                   with target = the sock centroid, standoff = ``approach_standoff``.
                   (only when not already reachable.)
-  4. RE_SEGMENT   /segment_socks again (sock now near) for a fresh grasp.
-  5. GRASP        ActionClient /grasp_object (jetank_manipulation/GraspObject) with
-                  a top-down PoseStamped at the (re-segmented) sock centroid.
-  6. DONE / FAILED  Report via the Trigger response.
+  4. GRASP        ActionClient /grasp_object (jetank_manipulation/GraspObject):
+                  transform the stored world-frame grasp pose back into
+                  ``target_frame`` at the latest TF (the base has driven up, so
+                  the sock is no longer visible to the fixed camera — we grasp
+                  open-loop from the remembered odom pose) and send it as the
+                  grasp target_pose.
+  5. DONE / FAILED  Report via the Trigger response.
 
-Any missing server / timeout / rejection at any step yields a *graceful*
-``Trigger`` response with ``success=false`` and a clear message — the coordinator
-never raises into the service.
+Any missing server / timeout / rejection / TF lookup failure at any step yields
+a *graceful* ``Trigger`` response with ``success=false`` and a clear message —
+the coordinator never raises into the service.
 
 Uses ActionClients on a ReentrantCallbackGroup under a MultiThreadedExecutor (the
 same idiom as ``grasp_pose_node.py``): each sub-call sends the goal then spins the
@@ -36,6 +44,7 @@ import math
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import (
@@ -44,6 +53,11 @@ from rclpy.qos import (
     QoSProfile,
     ReliabilityPolicy,
 )
+
+import tf2_ros
+# Importing tf2_geometry_msgs registers the PoseStamped transform so that
+# tf2_ros.Buffer.transform() can convert PoseStamped between frames.
+import tf2_geometry_msgs  # noqa: F401
 
 from std_srvs.srv import Trigger
 from geometry_msgs.msg import PointStamped, PoseStamped, Quaternion
@@ -58,7 +72,7 @@ from jetank_manipulation.grasp_pose_node import top_down_quaternion
 
 
 class MobileGraspCoordinator(Node):
-    """Trigger -> SEGMENT -> REACH_CHECK -> [APPROACH -> RE_SEGMENT] -> GRASP."""
+    """Trigger -> SEGMENT -> REACH_CHECK -> [APPROACH] -> GRASP -> DONE."""
 
     def __init__(self) -> None:
         super().__init__("mobile_grasp_coordinator")
@@ -69,6 +83,8 @@ class MobileGraspCoordinator(Node):
         self.declare_parameter("arm_base_xy", [0.06, 0.0])
         self.declare_parameter("approach_standoff", 0.18)
         self.declare_parameter("target_frame", "base_link")
+        # World-fixed frame used to remember the grasp pose across the drive.
+        self.declare_parameter("world_frame", "odom")
         self.declare_parameter("segment_action", "/segment_socks")
         self.declare_parameter("approach_action", "/approach_target")
         self.declare_parameter("grasp_action", "/grasp_object")
@@ -76,6 +92,15 @@ class MobileGraspCoordinator(Node):
         self.declare_parameter("segment_timeout_s", 10.0)
         self.declare_parameter("approach_timeout_s", 30.0)
         self.declare_parameter("grasp_timeout_s", 60.0)
+
+        # TF: capture the grasp pose in world_frame while the sock is visible,
+        # then retrieve it back into target_frame after the base has driven up.
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+
+        # World-fixed grasp pose captured during SEGMENT (PoseStamped in
+        # world_frame), retrieved into target_frame at GRASP time.
+        self._grasp_pose_world = None
 
         self._cb_group = ReentrantCallbackGroup()
 
@@ -123,11 +148,14 @@ class MobileGraspCoordinator(Node):
 
     def _on_trigger(self, _request, response):
         target_frame = self.get_parameter("target_frame").value
+        world_frame = self.get_parameter("world_frame").value
         arm_reach = float(self.get_parameter("arm_reach").value)
         arm_base = list(self.get_parameter("arm_base_xy").value)
         ax = float(arm_base[0]) if len(arm_base) > 0 else 0.06
         ay = float(arm_base[1]) if len(arm_base) > 1 else 0.0
         approach_standoff = float(self.get_parameter("approach_standoff").value)
+
+        self._grasp_pose_world = None
 
         # ---- 1. SEGMENT -------------------------------------------------
         self._log_state("SEGMENT")
@@ -143,6 +171,25 @@ class MobileGraspCoordinator(Node):
         self.get_logger().info(
             f"SEGMENT: sock '{sock.label}' score={sock.score:.2f} "
             f"centroid=({cx:.3f},{cy:.3f},{cz:.3f}) in {target_frame}."
+        )
+
+        # Build the top-down grasp pose in base_link (as the GRASP step always
+        # did), then remember it in the world frame while the sock is visible —
+        # this is the open-loop target we'll grasp after driving up.
+        grasp_pose_base = self._make_grasp_pose(target_frame, cx, cy, cz)
+        grasp_pose_world = self._to_frame(grasp_pose_base, world_frame)
+        if grasp_pose_world is None:
+            return self._fail(
+                response,
+                f"SEGMENT: TF {target_frame}->{world_frame} unavailable; "
+                "cannot remember grasp pose.",
+            )
+        self._grasp_pose_world = grasp_pose_world
+        self.get_logger().info(
+            f"SEGMENT: stored grasp pose in '{world_frame}' at "
+            f"({grasp_pose_world.pose.position.x:.3f},"
+            f"{grasp_pose_world.pose.position.y:.3f},"
+            f"{grasp_pose_world.pose.position.z:.3f})."
         )
 
         # ---- 2. REACH_CHECK --------------------------------------------
@@ -164,38 +211,38 @@ class MobileGraspCoordinator(Node):
                 return self._fail(response, f"APPROACH: {msg}")
             self.get_logger().info(f"APPROACH: {msg}")
 
-            # ---- 4. RE_SEGMENT -----------------------------------------
-            self._log_state("RE_SEGMENT")
-            sock = self._segment(target_frame)
-            if sock is None:
-                return self._fail(
-                    response,
-                    "RE_SEGMENT: no sock found after approach (moved out of view?).",
-                )
-            cx, cy, cz = (
-                sock.centroid.point.x,
-                sock.centroid.point.y,
-                sock.centroid.point.z,
-            )
-            self.get_logger().info(
-                f"RE_SEGMENT: sock '{sock.label}' centroid="
-                f"({cx:.3f},{cy:.3f},{cz:.3f}) in {target_frame}."
-            )
-
-        # ---- 5. GRASP ---------------------------------------------------
+        # ---- 4. GRASP (open-loop from the remembered world pose) --------
         self._log_state("GRASP")
-        grasp_pose = self._make_grasp_pose(target_frame, cx, cy, cz)
+        # The base has driven up and the fixed forward camera can no longer see
+        # the floor sock, so we do NOT re-segment. Instead transform the stored
+        # world-frame grasp pose back into base_link at the latest TF.
+        grasp_pose = self._from_world(self._grasp_pose_world, target_frame)
+        if grasp_pose is None:
+            return self._fail(
+                response,
+                f"GRASP: TF {world_frame}->{target_frame} unavailable; "
+                "cannot recover remembered grasp pose.",
+            )
+        gx, gy, gz = (
+            grasp_pose.pose.position.x,
+            grasp_pose.pose.position.y,
+            grasp_pose.pose.position.z,
+        )
+        self.get_logger().info(
+            f"GRASP: recovered grasp pose in '{target_frame}' at "
+            f"({gx:.3f},{gy:.3f},{gz:.3f})."
+        )
         self._pose_pub.publish(grasp_pose)
         ok, msg = self._grasp(grasp_pose)
         if not ok:
             return self._fail(response, f"GRASP: {msg}")
 
-        # ---- 6. DONE ----------------------------------------------------
+        # ---- 5. DONE ----------------------------------------------------
         self._log_state("DONE")
         response.success = True
         response.message = (
             f"Sock grasp complete. {'approached then ' if not reachable else ''}"
-            f"grasped at ({cx:.3f},{cy:.3f},{cz:.3f}) in {target_frame}. {msg}"
+            f"grasped at ({gx:.3f},{gy:.3f},{gz:.3f}) in {target_frame}. {msg}"
         )
         self.get_logger().info(response.message)
         return response
@@ -286,6 +333,40 @@ class MobileGraspCoordinator(Node):
             x=quat[0], y=quat[1], z=quat[2], w=quat[3]
         )
         return pose
+
+    # ------------------------------------------------------------------
+    # TF helpers (store grasp pose in world_frame; retrieve into base_link)
+    # ------------------------------------------------------------------
+
+    def _to_frame(self, pose: PoseStamped, target_frame: str):
+        """Transform *pose* into *target_frame* at its own stamp; None on failure."""
+        try:
+            return self._tf_buffer.transform(
+                pose, target_frame, timeout=Duration(seconds=0.5)
+            )
+        except (
+            tf2_ros.LookupException,
+            tf2_ros.ConnectivityException,
+            tf2_ros.ExtrapolationException,
+            tf2_ros.TransformException,
+        ) as exc:
+            self.get_logger().warn(
+                f"TF transform {pose.header.frame_id}->{target_frame} failed: {exc}"
+            )
+            return None
+
+    def _from_world(self, pose_world: PoseStamped, target_frame: str):
+        """Transform the stored world-frame pose into *target_frame* at latest TF.
+
+        The pose is world-fixed in ``world_frame``, so we stamp it with the
+        latest available time (``rclpy.time.Time(0)``) and let tf2 use the most
+        recent transform — the base may have moved since the pose was captured.
+        """
+        pose = PoseStamped()
+        pose.header.frame_id = pose_world.header.frame_id
+        pose.header.stamp = rclpy.time.Time().to_msg()
+        pose.pose = pose_world.pose
+        return self._to_frame(pose, target_frame)
 
     # ------------------------------------------------------------------
     # Generic action send/wait (mirrors grasp_pose_node._call_segment)
