@@ -329,12 +329,12 @@ _SRDF_STATES: dict = {
         "S5_joint": 0.0,
     },
     # Forward grasp poses, tuned from RViz (degrees -> rad):
-    #   grasp_reach: S2=106deg=1.850, S3=-15deg=-0.262 — reaches floor level.
+    #   grasp_reach: S2=105deg=1.8326, S3=-15deg=-0.262 — reaches floor level.
     #     S2=100deg/1.745 left the gripper ~8-10 cm ABOVE a floor sock (claws shut
     #     in the air above it). S2>=107deg drives the gripper INTO the floor and
     #     the trajectory controller TIMED_OUT / CONTROL_FAILED (jammed target).
-    #     106deg is the lowest reach that completes cleanly (swept 110->100 by
-    #     1deg). Re-tune here if the floor height changes.
+    #     105deg completes cleanly (swept 110->100 by 1deg; 106 also worked, 105
+    #     kept for margin). Re-tune here if the floor height changes.
     #   grasp_pre:   derived raised approach (S2=70deg=1.222, same S3)
     "grasp_pre": {
         "S1_joint": 0.0,
