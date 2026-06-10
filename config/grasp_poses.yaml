@@ -1,14 +1,14 @@
 /**:
   ros__parameters:
     # Named arm targets matching SRDF group_states (jetank_moveit_config/config/jetank.srdf).
-    # Sequence: grasp_pre -> (open) -> grasp_reach -> (close) -> grasp_pre -> home
-    # Approach/retreat use the FORWARD grasp_pre (NOT the legacy backward-tilted
-    # "ready", S2=-0.785) so the whole motion unfolds forward — no back-swing.
+    # Speed-optimised sequence: grasp_pre -> (open) -> grasp_reach -> (close) -> home.
+    # approach/retreat are EMPTY => those moves are SKIPPED (no redundant pre/back
+    # swing); the arm goes straight to grasp_pre, then lifts straight to home.
     arm_targets:
-      approach: "grasp_pre"
+      approach: ""
       pre_grasp: "grasp_pre"
       grasp: "grasp_reach"
-      retreat: "grasp_pre"
+      retreat: ""
       park: "home"
 
     # Gripper command widths (metres), sent via the
@@ -20,15 +20,28 @@
       max_effort: 5.0     # GripperCommand max_effort (N); 0 = unlimited
       # Dwell time (seconds) after publishing the gripper command before continuing.
       # Increase if the physical gripper is slow to reach its target.
-      dwell_after_open_s: 0.5
+      dwell_after_open_s: 0.2
       dwell_after_close_s: 0.8
 
-    # MoveIt2 motion parameters applied to every arm plan.
+    # MoveIt2 motion parameters applied to every arm plan. Speed-optimised:
+    # named targets are JOINT goals (solve instantly), so a tight planning budget
+    # removes the per-move wait; faster vel/accel cut execution time.
     motion:
-      velocity_scaling: 0.3         # fraction of max joint velocity (0..1)
-      acceleration_scaling: 0.3     # fraction of max joint acceleration (0..1)
-      allowed_planning_time_s: 5.0  # seconds for OMPL to find a plan
-      num_planning_attempts: 3      # retries per stage before aborting
+      velocity_scaling: 0.6         # fraction of max joint velocity (0..1)
+      acceleration_scaling: 0.5     # fraction of max joint acceleration (0..1)
+      allowed_planning_time_s: 1.5  # seconds for OMPL to find a plan
+      num_planning_attempts: 1      # retries per stage before aborting
+
+    # Pose-targeted grasp (Phase 7): when a GraspObject goal carries a target_pose,
+    # the EE link is driven to that Cartesian pose instead of the named presets.
+    pose_grasp:
+      approach_height_m: 0.06     # +Z standoff (m) for pre-grasp/retreat
+      # Constrain end-effector ORIENTATION as well as position?
+      # Keep FALSE: the 4-DOF arm (S1/S2/S3/S5) + KDL IK cannot satisfy a full
+      # 6-DOF pose, and an orientation constraint is the leading cause of
+      # move_group's "Catastrophic failure". Position-only lets IK pick any
+      # reachable wrist orientation. Enable only for a higher-DOF arm.
+      pose_use_orientation: false
 
     # Whether to use ROS sim time (set to true when running in Gazebo).
     use_sim_time: true
