@@ -250,9 +250,13 @@ class MobileGraspCoordinator(Node):
         # ---- 5. DONE ----------------------------------------------------
         self._log_state("DONE")
         response.success = True
+        # Report the sock centroid (cx,cy,cz) — always in scope. The earlier
+        # gx/gy/gz here were never assigned (NameError on the first successful
+        # grasp); preset mode sends no pose, so the centroid is the meaningful
+        # grasp location to report.
         response.message = (
             f"Sock grasp complete. {'approached then ' if not reachable else ''}"
-            f"grasped at ({gx:.3f},{gy:.3f},{gz:.3f}) in {target_frame}. {msg}"
+            f"grasped at ({cx:.3f},{cy:.3f},{cz:.3f}) in {target_frame}. {msg}"
         )
         self.get_logger().info(response.message)
         return response

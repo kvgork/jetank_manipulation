@@ -328,13 +328,14 @@ _SRDF_STATES: dict = {
         "S3_joint": 1.047,
         "S5_joint": 0.0,
     },
-    # Forward grasp poses, tuned from RViz 2026-06-06 (degrees -> rad):
-    #   grasp_reach: S2=100deg=1.745, S3=-15deg=-0.262
+    # Forward grasp poses, tuned from RViz (degrees -> rad):
+    #   grasp_reach: S2=106deg=1.850, S3=-15deg=-0.262 — reaches floor level.
+    #     S2=100deg/1.745 left the gripper ~8-10 cm ABOVE a floor sock (claws shut
+    #     in the air above it). S2>=107deg drives the gripper INTO the floor and
+    #     the trajectory controller TIMED_OUT / CONTROL_FAILED (jammed target).
+    #     106deg is the lowest reach that completes cleanly (swept 110->100 by
+    #     1deg). Re-tune here if the floor height changes.
     #   grasp_pre:   derived raised approach (S2=70deg=1.222, same S3)
-    # The arm cannot touch the floor: below ~0.10 m the wrist (S5_link) self-
-    # collides with the arm-mounted camera (camera_link) and move_group refuses
-    # to plan. To go lower, resolve that collision (relocate camera or relax the
-    # pair) or correct the URDF primitive link lengths to real dims.
     "grasp_pre": {
         "S1_joint": 0.0,
         "S2_joint": 1.222,
@@ -343,7 +344,7 @@ _SRDF_STATES: dict = {
     },
     "grasp_reach": {
         "S1_joint": 0.0,
-        "S2_joint": 1.745,
+        "S2_joint": 1.8326,
         "S3_joint": -0.262,
         "S5_joint": 0.0,
     },
@@ -362,19 +363,27 @@ class GraspServer(Node):
         super().__init__("grasp_server")
 
         # Parameters (all tunable via grasp_poses.yaml)
-        self.declare_parameter("motion.velocity_scaling", 0.3)
-        self.declare_parameter("motion.acceleration_scaling", 0.3)
-        self.declare_parameter("motion.allowed_planning_time_s", 5.0)
-        self.declare_parameter("motion.num_planning_attempts", 3)
+        # Speed-optimised 2026-06-10 (grasp was ~60-90s; see plans/
+        # grasp-speed-optimization-plan.md): faster vel/acc, and a tight planning
+        # budget because the named targets are JOINT goals that solve instantly —
+        # 5s x 3 attempts was the bulk of the per-move "long wait".
+        self.declare_parameter("motion.velocity_scaling", 0.6)
+        self.declare_parameter("motion.acceleration_scaling", 0.5)
+        self.declare_parameter("motion.allowed_planning_time_s", 1.5)
+        self.declare_parameter("motion.num_planning_attempts", 1)
         self.declare_parameter("gripper.open_width", 0.04)
         self.declare_parameter("gripper.close_width", 0.0)
         self.declare_parameter("gripper.max_effort", 5.0)
-        self.declare_parameter("gripper.dwell_after_open_s", 0.5)
+        self.declare_parameter("gripper.dwell_after_open_s", 0.2)
         self.declare_parameter("gripper.dwell_after_close_s", 0.8)
-        self.declare_parameter("arm_targets.approach", "ready")
+        # approach/retreat empty => SKIP that move. The old "ready" approach swung
+        # the arm BACKWARD (S2=-45deg) before grasp_pre (+70deg) for no reason, and
+        # retreat-via-ready added a second backward swing. Go home/current ->
+        # grasp_pre directly, and retreat straight to home (= park).
+        self.declare_parameter("arm_targets.approach", "")
         self.declare_parameter("arm_targets.pre_grasp", "grasp_pre")
         self.declare_parameter("arm_targets.grasp", "grasp_reach")
-        self.declare_parameter("arm_targets.retreat", "ready")
+        self.declare_parameter("arm_targets.retreat", "")
         self.declare_parameter("arm_targets.park", "home")
         # Phase 7 pose-targeted grasp: default pre-grasp/retreat standoff (+Z, m)
         # above the target pose. Used when the goal's approach_height is <= 0.
@@ -614,12 +623,14 @@ class GraspServer(Node):
 
         self.get_logger().info("GraspObject: legacy preset grasp (no target_pose).")
 
-        # --- Preset grasp sequence (legacy; unchanged behaviour) ---
-        # Step 1: move to approach (ready)
-        pub_feedback("moving_to_approach")
-        if not await move_to(t_approach):
-            await self._abort_and_retreat(goal_handle, result, move_to, t_park)
-            return result
+        # --- Preset grasp sequence (speed-optimised) ---
+        # Step 1: move to approach. SKIPPED when t_approach is empty (default) —
+        # the old "ready" approach was a redundant backward swing.
+        if t_approach:
+            pub_feedback("moving_to_approach")
+            if not await move_to(t_approach):
+                await self._abort_and_retreat(goal_handle, result, move_to, t_park)
+                return result
 
         # Step 2: move to pre-grasp
         pub_feedback("moving_to_pre_grasp")
@@ -643,13 +654,14 @@ class GraspServer(Node):
         await command_gripper(close_width, max_effort)
         time.sleep(dwell_close)
 
-        # Step 6: retreat to ready
-        pub_feedback("retreating")
-        if not await move_to(t_retreat):
-            # Already attempted grasp; retreat failure is non-fatal but logged
-            self.get_logger().warn("Retreat to ready failed; attempting park at home.")
+        # Step 6: retreat. SKIPPED when t_retreat is empty (default) — retreat
+        # straight to park (home) instead of swinging through "ready" first.
+        if t_retreat:
+            pub_feedback("retreating")
+            if not await move_to(t_retreat):
+                self.get_logger().warn("Retreat failed; attempting park at home.")
 
-        # Step 7: park at home
+        # Step 7: park at home (lifts the grasped sock up)
         pub_feedback("parking")
         await move_to(t_park)
 
