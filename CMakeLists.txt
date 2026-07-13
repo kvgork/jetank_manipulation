@@ -8,7 +8,6 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_python REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
-find_package(std_msgs REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(geometry_msgs REQUIRED)
 # Runtime dependency of grasp_pose_node (pure-python node); declaring it here
@@ -24,7 +23,7 @@ find_package(jetank_detection REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/GraspObject.action"
   "action/ApproachTarget.action"
-  DEPENDENCIES std_msgs builtin_interfaces geometry_msgs
+  DEPENDENCIES builtin_interfaces geometry_msgs
 )
 
 # Install source Python package alongside the generated bindings.
