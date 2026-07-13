@@ -93,6 +93,34 @@ def _install_stubs():
         jda.SegmentSocks = type("SegmentSocks", (), {})
         jd.action = jda
 
+    # ---- jetank_manipulation.grasp_math / action_utils ----
+    # grasp_pose_node imports these package-qualified. In a bare env (no
+    # colcon build) the package is unimportable or resolves to a stub, so
+    # load the REAL source modules by file path and register them under
+    # their fully-qualified names (their own deps are stubbed above).
+    pkg_dir = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "jetank_manipulation")
+    )
+    if "jetank_manipulation" not in sys.modules:
+        try:
+            importlib.import_module("jetank_manipulation")
+        except Exception:
+            _make_stub("jetank_manipulation")
+    for sub in ("grasp_math", "action_utils"):
+        fq = f"jetank_manipulation.{sub}"
+        if fq in sys.modules:
+            continue
+        try:
+            importlib.import_module(fq)
+        except Exception:
+            spec = importlib.util.spec_from_file_location(
+                fq, os.path.join(pkg_dir, f"{sub}.py")
+            )
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[fq] = mod
+            spec.loader.exec_module(mod)
+            setattr(sys.modules["jetank_manipulation"], sub, mod)
+
 
 _install_stubs()
 
