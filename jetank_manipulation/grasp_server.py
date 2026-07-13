@@ -19,6 +19,7 @@ Usage:
 
 import math
 import time
+from dataclasses import dataclass
 
 import rclpy
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
@@ -354,6 +355,27 @@ _SRDF_STATES: dict = {
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class _GraspParams:
+    """Per-goal snapshot of the grasp parameters (read once per accepted goal)."""
+
+    vel_scale: float
+    acc_scale: float
+    plan_time: float
+    num_attempts: int
+    open_width: float
+    close_width: float
+    max_effort: float
+    dwell_open: float
+    dwell_close: float
+    t_approach: str
+    t_pre_grasp: str
+    t_grasp: str
+    t_retreat: str
+    t_park: str
+    pose_use_orientation: bool
+
+
 class GraspServer(Node):
     """Action server that executes a deterministic open-loop preset grasp."""
 
@@ -494,105 +516,10 @@ class GraspServer(Node):
         return False
 
     async def _execute_cb(self, goal_handle):
-        """Run the full grasp sequence asynchronously."""
+        """Dispatch a GraspObject goal to the pose-targeted or preset sequence."""
         self.get_logger().info("Executing GraspObject sequence...")
-        feedback_msg = GraspObject.Feedback()
         result = GraspObject.Result()
-
-        # Read parameters
-        vel_scale = self.get_parameter("motion.velocity_scaling").value
-        acc_scale = self.get_parameter("motion.acceleration_scaling").value
-        plan_time = self.get_parameter("motion.allowed_planning_time_s").value
-        num_attempts = int(self.get_parameter("motion.num_planning_attempts").value)
-        open_width = float(self.get_parameter("gripper.open_width").value)
-        close_width = float(self.get_parameter("gripper.close_width").value)
-        max_effort = float(self.get_parameter("gripper.max_effort").value)
-        dwell_open = float(self.get_parameter("gripper.dwell_after_open_s").value)
-        dwell_close = float(self.get_parameter("gripper.dwell_after_close_s").value)
-
-        t_approach = self.get_parameter("arm_targets.approach").value
-        t_pre_grasp = self.get_parameter("arm_targets.pre_grasp").value
-        t_grasp = self.get_parameter("arm_targets.grasp").value
-        t_retreat = self.get_parameter("arm_targets.retreat").value
-        t_park = self.get_parameter("arm_targets.park").value
-
-        pose_use_orientation = bool(
-            self.get_parameter("pose_grasp.pose_use_orientation").value
-        )
-
-        def pub_feedback(stage: str):
-            feedback_msg.stage = stage
-            goal_handle.publish_feedback(feedback_msg)
-            self.get_logger().info(f"Stage: {stage}")
-
-        async def command_gripper(width: float, effort: float) -> bool:
-            """Send a GripperCommand action goal.
-
-            Returns True if the action server accepted the goal and returned a
-            result (stall or success); False if the server is absent — the
-            caller degrades gracefully and the grasp sequence continues.
-            """
-            if not self._gripper_client.wait_for_server(timeout_sec=5.0):
-                self.get_logger().warn(
-                    f"GripperCommand action server {_GRIPPER_ACTION} not available — "
-                    "skipping gripper command."
-                )
-                return False
-
-            gripper_goal = GripperCommand.Goal()
-            gripper_goal.command.position = width
-            gripper_goal.command.max_effort = effort
-
-            self.get_logger().info(
-                f"Sending GripperCommand: position={width:.4f} m, effort={effort:.1f} N"
-            )
-            send_future = await self._gripper_client.send_goal_async(gripper_goal)
-
-            if not send_future.accepted:
-                self.get_logger().error("GripperCommand goal rejected.")
-                return False
-
-            result_future = await send_future.get_result_async()
-            gripper_result = result_future.result
-            self.get_logger().info(
-                f"GripperCommand done: position={gripper_result.position:.4f}, "
-                f"stalled={gripper_result.stalled}, reached_goal={gripper_result.reached_goal}"
-            )
-            return True
-
-        async def move_to(target_name: str) -> bool:
-            """Plan and execute arm motion to a named SRDF target. Returns True on success."""
-            try:
-                req = _named_target_request(
-                    ARM_GROUP,
-                    target_name,
-                    plan_time,
-                    num_attempts,
-                    vel_scale,
-                    acc_scale,
-                )
-            except ValueError as exc:
-                self.get_logger().error(str(exc))
-                return False
-            return await self._execute_move_request(req, target_name)
-
-        async def move_to_pose(pose_stamped: PoseStamped, label: str) -> bool:
-            """Plan and execute arm motion so EE_LINK reaches *pose_stamped*.
-
-            Pose-targeted counterpart to ``move_to``; shares the same MoveGroup
-            send/wait plumbing via ``_execute_move_request``.
-            """
-            req = _pose_target_request(
-                ARM_GROUP,
-                pose_stamped,
-                plan_time,
-                num_attempts,
-                vel_scale,
-                acc_scale,
-                include_orientation=pose_use_orientation,
-                logger=self.get_logger(),
-            )
-            return await self._execute_move_request(req, label)
+        p = self._snapshot_params()
 
         # --- Branch: pose-targeted (Phase 7) vs legacy preset grasp ---
         target_pose = goal_handle.request.target_pose
@@ -605,78 +532,188 @@ class GraspServer(Node):
                 goal_handle,
                 result,
                 target_pose,
-                approach_height=self._resolve_approach_height(goal_handle),
-                t_approach=t_approach,
-                t_park=t_park,
-                open_width=open_width,
-                close_width=close_width,
-                max_effort=max_effort,
-                dwell_open=dwell_open,
-                dwell_close=dwell_close,
-                pub_feedback=pub_feedback,
-                command_gripper=command_gripper,
-                move_to=move_to,
-                move_to_pose=move_to_pose,
+                self._resolve_approach_height(goal_handle),
+                p,
             )
 
         self.get_logger().info("GraspObject: legacy preset grasp (no target_pose).")
+        return await self._run_preset_grasp(goal_handle, result, p)
 
-        # --- Preset grasp sequence (speed-optimised) ---
+    # ------------------------------------------------------------------
+    # Per-goal building blocks (shared by the preset and pose sequences)
+    # ------------------------------------------------------------------
+
+    def _snapshot_params(self) -> _GraspParams:
+        """Read the grasp parameters once per goal into a single bundle."""
+        return _GraspParams(
+            vel_scale=self.get_parameter("motion.velocity_scaling").value,
+            acc_scale=self.get_parameter("motion.acceleration_scaling").value,
+            plan_time=self.get_parameter("motion.allowed_planning_time_s").value,
+            num_attempts=int(
+                self.get_parameter("motion.num_planning_attempts").value
+            ),
+            open_width=float(self.get_parameter("gripper.open_width").value),
+            close_width=float(self.get_parameter("gripper.close_width").value),
+            max_effort=float(self.get_parameter("gripper.max_effort").value),
+            dwell_open=float(
+                self.get_parameter("gripper.dwell_after_open_s").value
+            ),
+            dwell_close=float(
+                self.get_parameter("gripper.dwell_after_close_s").value
+            ),
+            t_approach=self.get_parameter("arm_targets.approach").value,
+            t_pre_grasp=self.get_parameter("arm_targets.pre_grasp").value,
+            t_grasp=self.get_parameter("arm_targets.grasp").value,
+            t_retreat=self.get_parameter("arm_targets.retreat").value,
+            t_park=self.get_parameter("arm_targets.park").value,
+            pose_use_orientation=bool(
+                self.get_parameter("pose_grasp.pose_use_orientation").value
+            ),
+        )
+
+    def _publish_stage(self, goal_handle, stage: str) -> None:
+        """Publish action feedback for *stage* and log it."""
+        feedback_msg = GraspObject.Feedback()
+        feedback_msg.stage = stage
+        goal_handle.publish_feedback(feedback_msg)
+        self.get_logger().info(f"Stage: {stage}")
+
+    async def _command_gripper(self, width: float, effort: float) -> bool:
+        """Send a GripperCommand action goal.
+
+        Returns True if the action server accepted the goal and returned a
+        result (stall or success); False if the server is absent — the
+        caller degrades gracefully and the grasp sequence continues.
+        """
+        if not self._gripper_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().warn(
+                f"GripperCommand action server {_GRIPPER_ACTION} not available — "
+                "skipping gripper command."
+            )
+            return False
+
+        gripper_goal = GripperCommand.Goal()
+        gripper_goal.command.position = width
+        gripper_goal.command.max_effort = effort
+
+        self.get_logger().info(
+            f"Sending GripperCommand: position={width:.4f} m, effort={effort:.1f} N"
+        )
+        send_future = await self._gripper_client.send_goal_async(gripper_goal)
+
+        if not send_future.accepted:
+            self.get_logger().error("GripperCommand goal rejected.")
+            return False
+
+        result_future = await send_future.get_result_async()
+        gripper_result = result_future.result
+        self.get_logger().info(
+            f"GripperCommand done: position={gripper_result.position:.4f}, "
+            f"stalled={gripper_result.stalled}, reached_goal={gripper_result.reached_goal}"
+        )
+        return True
+
+    async def _move_to_named(self, target_name: str, p: _GraspParams) -> bool:
+        """Plan and execute arm motion to a named SRDF target. Returns True on success."""
+        try:
+            req = _named_target_request(
+                ARM_GROUP,
+                target_name,
+                p.plan_time,
+                p.num_attempts,
+                p.vel_scale,
+                p.acc_scale,
+            )
+        except ValueError as exc:
+            self.get_logger().error(str(exc))
+            return False
+        return await self._execute_move_request(req, target_name)
+
+    async def _move_to_pose(
+        self, pose_stamped: PoseStamped, label: str, p: _GraspParams
+    ) -> bool:
+        """Plan and execute arm motion so EE_LINK reaches *pose_stamped*.
+
+        Pose-targeted counterpart to ``_move_to_named``; shares the same
+        MoveGroup send/wait plumbing via ``_execute_move_request``.
+        """
+        req = _pose_target_request(
+            ARM_GROUP,
+            pose_stamped,
+            p.plan_time,
+            p.num_attempts,
+            p.vel_scale,
+            p.acc_scale,
+            include_orientation=p.pose_use_orientation,
+            logger=self.get_logger(),
+        )
+        return await self._execute_move_request(req, label)
+
+    # ------------------------------------------------------------------
+    # Preset grasp sequence
+    # ------------------------------------------------------------------
+
+    async def _run_preset_grasp(self, goal_handle, result, p: _GraspParams):
+        """Legacy preset grasp sequence (speed-optimised SRDF named targets).
+
+        approach? -> pre_grasp -> open gripper -> grasp -> close gripper ->
+        retreat? -> park.
+        """
         # Step 1: move to approach. SKIPPED when t_approach is empty (default) —
         # the old "ready" approach was a redundant backward swing.
-        if t_approach:
-            pub_feedback("moving_to_approach")
-            if not await move_to(t_approach):
-                await self._abort_and_retreat(goal_handle, result, move_to, t_park)
+        if p.t_approach:
+            self._publish_stage(goal_handle, "moving_to_approach")
+            if not await self._move_to_named(p.t_approach, p):
+                await self._abort_and_retreat(goal_handle, result, p)
                 return result
 
         # Step 2: move to pre-grasp
-        pub_feedback("moving_to_pre_grasp")
-        if not await move_to(t_pre_grasp):
-            await self._abort_and_retreat(goal_handle, result, move_to, t_park)
+        self._publish_stage(goal_handle, "moving_to_pre_grasp")
+        if not await self._move_to_named(p.t_pre_grasp, p):
+            await self._abort_and_retreat(goal_handle, result, p)
             return result
 
         # Step 3: open gripper
-        pub_feedback("opening_gripper")
-        await command_gripper(open_width, max_effort)
-        time.sleep(dwell_open)
+        self._publish_stage(goal_handle, "opening_gripper")
+        await self._command_gripper(p.open_width, p.max_effort)
+        time.sleep(p.dwell_open)
 
         # Step 4: move to grasp
-        pub_feedback("moving_to_grasp")
-        if not await move_to(t_grasp):
-            await self._abort_and_retreat(goal_handle, result, move_to, t_park)
+        self._publish_stage(goal_handle, "moving_to_grasp")
+        if not await self._move_to_named(p.t_grasp, p):
+            await self._abort_and_retreat(goal_handle, result, p)
             return result
 
         # Step 5: close gripper
-        pub_feedback("closing_gripper")
-        await command_gripper(close_width, max_effort)
-        time.sleep(dwell_close)
+        self._publish_stage(goal_handle, "closing_gripper")
+        await self._command_gripper(p.close_width, p.max_effort)
+        time.sleep(p.dwell_close)
 
         # Step 6: retreat. SKIPPED when t_retreat is empty (default) — retreat
         # straight to park (home) instead of swinging through "ready" first.
-        if t_retreat:
-            pub_feedback("retreating")
-            if not await move_to(t_retreat):
+        if p.t_retreat:
+            self._publish_stage(goal_handle, "retreating")
+            if not await self._move_to_named(p.t_retreat, p):
                 self.get_logger().warn("Retreat failed; attempting park at home.")
 
         # Step 7: park at home (lifts the grasped sock up)
-        pub_feedback("parking")
-        await move_to(t_park)
+        self._publish_stage(goal_handle, "parking")
+        await self._move_to_named(p.t_park, p)
 
-        pub_feedback("done")
+        self._publish_stage(goal_handle, "done")
         result.success = True
         result.message = "Grasp sequence completed successfully."
         goal_handle.succeed()
         self.get_logger().info("GraspObject: SUCCESS")
         return result
 
-    async def _abort_and_retreat(self, goal_handle, result, move_to_fn, park_target: str):
+    async def _abort_and_retreat(self, goal_handle, result, p: _GraspParams):
         """Publish abort stage, retreat to home, and set the goal as aborted."""
         fb = GraspObject.Feedback()
         fb.stage = "aborting_retreat"
         goal_handle.publish_feedback(fb)
         self.get_logger().warn("GraspObject: plan/execute failed — retreating to home.")
-        await move_to_fn(park_target)
+        await self._move_to_named(p.t_park, p)
         result.success = False
         result.message = "Motion failed; retreated to home."
         goal_handle.abort()
@@ -713,17 +750,7 @@ class GraspServer(Node):
         result,
         target_pose: PoseStamped,
         approach_height: float,
-        t_approach: str,
-        t_park: str,
-        open_width: float,
-        close_width: float,
-        max_effort: float,
-        dwell_open: float,
-        dwell_close: float,
-        pub_feedback,
-        command_gripper,
-        move_to,
-        move_to_pose,
+        p: _GraspParams,
     ):
         """Pose-targeted grasp sequence.
 
@@ -742,45 +769,45 @@ class GraspServer(Node):
         )
 
         # Step 1: move to approach (preset 'ready' — known-safe starting pose)
-        pub_feedback("moving_to_approach")
-        if not await move_to(t_approach):
-            await self._abort_and_retreat(goal_handle, result, move_to, t_park)
+        self._publish_stage(goal_handle, "moving_to_approach")
+        if not await self._move_to_named(p.t_approach, p):
+            await self._abort_and_retreat(goal_handle, result, p)
             return result
 
         # Step 2: pre-grasp (target pose raised by approach_height)
-        pub_feedback("pre_grasp")
-        if not await move_to_pose(pre_grasp_pose, "pre_grasp"):
-            await self._abort_and_retreat(goal_handle, result, move_to, t_park)
+        self._publish_stage(goal_handle, "pre_grasp")
+        if not await self._move_to_pose(pre_grasp_pose, "pre_grasp", p):
+            await self._abort_and_retreat(goal_handle, result, p)
             return result
 
         # Step 3: open gripper
-        pub_feedback("opening_gripper")
-        await command_gripper(open_width, max_effort)
-        time.sleep(dwell_open)
+        self._publish_stage(goal_handle, "opening_gripper")
+        await self._command_gripper(p.open_width, p.max_effort)
+        time.sleep(p.dwell_open)
 
         # Step 4: reach (the target pose itself)
-        pub_feedback("reach")
-        if not await move_to_pose(target_pose, "reach"):
-            await self._abort_and_retreat(goal_handle, result, move_to, t_park)
+        self._publish_stage(goal_handle, "reach")
+        if not await self._move_to_pose(target_pose, "reach", p):
+            await self._abort_and_retreat(goal_handle, result, p)
             return result
 
         # Step 5: close gripper
-        pub_feedback("close")
-        await command_gripper(close_width, max_effort)
-        time.sleep(dwell_close)
+        self._publish_stage(goal_handle, "close")
+        await self._command_gripper(p.close_width, p.max_effort)
+        time.sleep(p.dwell_close)
 
         # Step 6: retreat (back up to the pre-grasp standoff)
-        pub_feedback("retreat")
-        if not await move_to_pose(pre_grasp_pose, "retreat"):
+        self._publish_stage(goal_handle, "retreat")
+        if not await self._move_to_pose(pre_grasp_pose, "retreat", p):
             self.get_logger().warn(
                 "Pose-grasp retreat failed; attempting park at home."
             )
 
         # Step 7: park at home (preset)
-        pub_feedback("parking")
-        await move_to(t_park)
+        self._publish_stage(goal_handle, "parking")
+        await self._move_to_named(p.t_park, p)
 
-        pub_feedback("done")
+        self._publish_stage(goal_handle, "done")
         result.success = True
         result.message = "Pose-targeted grasp sequence completed successfully."
         goal_handle.succeed()
