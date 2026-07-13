@@ -21,10 +21,8 @@ import math
 import time
 from dataclasses import dataclass
 
-import rclpy
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
 from control_msgs.action import GripperCommand
@@ -821,20 +819,11 @@ class GraspServer(Node):
 
 
 def main(args=None):
-    rclpy.init(args=args)
-    node = GraspServer()
-    executor = MultiThreadedExecutor()
-    executor.add_node(node)
-    try:
-        executor.spin()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        try:
-            rclpy.shutdown()
-        except Exception:
-            pass
+    # Imported at call time so bare-env tests can load this module by file
+    # path with only the imports above stubbed.
+    from jetank_manipulation.node_runner import spin_node
+
+    spin_node(GraspServer, args)
 
 
 if __name__ == "__main__":

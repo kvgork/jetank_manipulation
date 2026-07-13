@@ -46,7 +46,6 @@ import rclpy
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
-from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
 import tf2_ros
@@ -424,20 +423,11 @@ class MobileGraspCoordinator(Node):
 
 
 def main(args=None):
-    rclpy.init(args=args)
-    node = MobileGraspCoordinator()
-    executor = MultiThreadedExecutor()
-    executor.add_node(node)
-    try:
-        executor.spin()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        try:
-            rclpy.shutdown()
-        except Exception:
-            pass
+    # Imported at call time so bare-env tests can load this module by file
+    # path with only the imports above stubbed.
+    from jetank_manipulation.node_runner import spin_node
+
+    spin_node(MobileGraspCoordinator, args)
 
 
 if __name__ == "__main__":
