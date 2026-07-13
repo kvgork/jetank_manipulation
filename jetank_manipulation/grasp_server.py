@@ -61,12 +61,10 @@ EE_LINK = "S5_link"
 # end-effector orientation. We therefore treat the requested orientation as a
 # best-effort hint: position is constrained tightly, orientation loosely. These
 # generous tolerances (radians) let IK/planning find a solution on the axes the
-# arm cannot independently control. ~pi means "effectively unconstrained".
+# arm cannot independently control. ~pi means "effectively unconstrained". The
+# loose tolerance is used on all three axes; tighten it only if a future,
+# higher-DOF arm warrants it.
 _ORI_TOL_LOOSE = 3.14
-# The arm CAN control the approach (top-down) about base yaw fairly well, so we
-# leave the loose tolerance on all three axes by default; tighten via a tighter
-# value here only if a future, higher-DOF arm warrants it.
-_ORI_TOL_TIGHT = 3.14
 
 # Side length of the position-constraint tolerance box around the target point.
 _POSITION_BOX_SIZE_M = 0.02
