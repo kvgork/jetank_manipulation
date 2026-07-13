@@ -224,7 +224,6 @@ class BaseApproachNode(Node):
         deadline_ns = start_ns + int(timeout * 1e9) if timeout > 0.0 else None
 
         last_dist = float("nan")
-        rate = self.create_rate(control_rate if control_rate > 0.0 else 10.0)
 
         try:
             while rclpy.ok():
@@ -258,7 +257,7 @@ class BaseApproachNode(Node):
                 if dx_dy is None:
                     # Transient TF gap: hold still, retry next tick.
                     self._stop()
-                    self._sleep_rate(rate, period)
+                    self._sleep_period(period)
                     continue
 
                 dx, dy = dx_dy
@@ -288,7 +287,7 @@ class BaseApproachNode(Node):
                     return result
 
                 self._publish_cmd(lin, ang, base_frame)
-                self._sleep_rate(rate, period)
+                self._sleep_period(period)
 
         finally:
             # Defensive: never leave the base creeping if we exit unexpectedly.
@@ -379,12 +378,14 @@ class BaseApproachNode(Node):
         base_frame = self.get_parameter("base_frame").value
         self._publish_cmd(0.0, 0.0, base_frame)
 
-    def _sleep_rate(self, rate, period: float) -> None:
+    @staticmethod
+    def _sleep_period(period: float) -> None:
         """Sleep one control period.
 
-        Uses a plain time.sleep so the loop ticks even without a wall executor
-        thread driving Rate (Rate.sleep can deadlock on a single-thread spin);
-        the MultiThreadedExecutor keeps servicing TF / cancel concurrently.
+        Uses a plain time.sleep instead of a node Rate: Rate.sleep can deadlock
+        on a single-thread spin, and create_rate attaches a real node timer that
+        would keep firing (leak) for the life of the node. The
+        MultiThreadedExecutor keeps servicing TF / cancel concurrently.
         """
         import time
 
