@@ -158,12 +158,16 @@ EXPECTED_STATES = {
     "home": {"S1_joint": 0.0, "S2_joint": 0.0, "S3_joint": 0.0, "S5_joint": 0.0},
     "ready": {"S1_joint": 0.0, "S2_joint": -0.785, "S3_joint": 1.047, "S5_joint": 0.0},
     "grasp_pre": {"S1_joint": 0.0, "S2_joint": 1.222, "S3_joint": -0.262, "S5_joint": 0.0},
-    "grasp_reach": {"S1_joint": 0.0, "S2_joint": 1.745, "S3_joint": -0.262, "S5_joint": 0.0},
+    # grasp_reach S2 deliberately deviates from jetank.srdf (1.745 / 100 deg):
+    # hardware floor-reach tuning raised it to 105 deg = 1.8326 (see 2a54b9e —
+    # 100 deg closed the gripper 8-10 cm above a floor sock).
+    "grasp_reach": {"S1_joint": 0.0, "S2_joint": 1.8326, "S3_joint": -0.262, "S5_joint": 0.0},
 }
 
 
 def test_srdf_states_exact_values():
-    """Joint targets must match the values mirrored from jetank.srdf."""
+    """Joint targets must match jetank.srdf, except the documented
+    hardware-tuned grasp_reach S2 floor-reach override (105 deg)."""
     assert set(gs._SRDF_STATES) == set(EXPECTED_STATES)
     for state, joints in EXPECTED_STATES.items():
         assert gs._SRDF_STATES[state] == pytest.approx(joints)
