@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Grasp-pose planning node for the JeTank arm.
+"""
+Grasp-pose planning node for the JeTank arm.
 
 Computes a *top-down* grasp pose from a segmented sock point-cloud blob. It does
 **not** move the arm — it only outputs a ``geometry_msgs/PoseStamped`` and an

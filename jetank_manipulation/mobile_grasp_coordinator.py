@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Mobile-manipulation grasp coordinator for the JeTank (Phase 7).
+"""
+Mobile-manipulation grasp coordinator for the JeTank (Phase 7).
 
 A *thin* state machine that ORCHESTRATES the existing modular pieces purely via
 their ROS interfaces — it owns no perception, motion or driving logic of its own.
@@ -314,7 +315,8 @@ class MobileGraspCoordinator(Node):
         )
 
     def _grasp(self, grasp_pose):
-        """Call /grasp_object; return (ok, message).
+        """
+        Call /grasp_object; return (ok, message).
 
         grasp_pose=None -> PRESET grasp (empty target_pose: grasp_server runs its
         tuned grasp_pre/grasp_reach joint sequence). A PoseStamped -> pose-targeted.
@@ -337,7 +339,8 @@ class MobileGraspCoordinator(Node):
         return bool(result.success), result.message or ""
 
     def _make_grasp_pose(self, frame_id, sock) -> PoseStamped:
-        """Top-down PoseStamped for *sock* via the shared grasp_math pipeline.
+        """
+        Top-down PoseStamped for *sock* via the shared grasp_math pipeline.
 
         Uses ``compute_grasp_fields`` on the segmented cloud — the same math
         as ``grasp_pose_node`` — so the PCA long-axis yaw and top-of-blob z
@@ -390,7 +393,8 @@ class MobileGraspCoordinator(Node):
             return None
 
     def _from_world(self, pose_world: PoseStamped, target_frame: str):
-        """Transform the stored world-frame pose into *target_frame* at latest TF.
+        """
+        Transform the stored world-frame pose into *target_frame* at latest TF.
 
         The pose is world-fixed in ``world_frame``, so we stamp it with the
         latest available time (``rclpy.time.Time(0)``) and let tf2 use the most

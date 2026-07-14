@@ -1,4 +1,5 @@
-"""Unit tests for the pure grasp-pose math in ``grasp_pose_node``.
+"""
+Unit tests for the pure grasp-pose math in ``grasp_pose_node``.
 
 The node module imports rclpy / ROS message packages at import time. To keep the
 *pure* math (``compute_grasp_fields``, ``pca_long_axis_yaw``,
@@ -185,7 +186,7 @@ def test_pca_degenerate_returns_none():
 # ---------------------------------------------------------------------------
 
 def _elongated_x_cloud():
-    """A flat sock elongated along +x, top at z=0.20."""
+    """Build a flat sock cloud elongated along +x, top at z=0.20."""
     n = 60
     xs = np.linspace(-0.10, 0.10, n)
     ys = np.full(n, 0.0)

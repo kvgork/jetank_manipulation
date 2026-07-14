@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""GraspObject action server for the JeTank arm.
+"""
+GraspObject action server for the JeTank arm.
 
 Performs an open-loop preset grasp via MoveIt2's /move_action action server.
 moveit_py is not available in this RoboStack Humble environment, so we drive
@@ -76,7 +77,8 @@ _WORKSPACE_HALF_EXTENT_M = 1.0
 
 
 def _moveit_error_name(val: int) -> str:
-    """Map a moveit_msgs/MoveItErrorCodes ``.val`` to its symbolic name.
+    """
+    Map a moveit_msgs/MoveItErrorCodes ``.val`` to its symbolic name.
 
     Reflects the int constants off the generated ``MoveItErrorCodes`` message
     (e.g. ``SUCCESS=1``, ``PLANNING_FAILED=-1``, ``NO_IK_SOLUTION=-31``,
@@ -95,7 +97,8 @@ def _moveit_error_name(val: int) -> str:
 
 
 def _normalized_quaternion(q):
-    """Return (x, y, z, w) of *q* normalized to unit length.
+    """
+    Return (x, y, z, w) of *q* normalized to unit length.
 
     move_group's orientation-constraint validator throws a *catastrophic*
     failure (error_code 99999) on a non-unit — especially an all-zero
@@ -120,7 +123,8 @@ def _named_target_request(
     vel_scale: float,
     acc_scale: float,
 ) -> MotionPlanRequest:
-    """Build a MotionPlanRequest moving *group_name* to a named SRDF target.
+    """
+    Build a MotionPlanRequest moving *group_name* to a named SRDF target.
 
     The MoveGroup action goal only accepts explicit joint values or Cartesian
     poses (named-target resolution lives in a separate move_group service, not
@@ -172,7 +176,8 @@ def _pose_target_request(
     ori_tol_z: float = _ORI_TOL_LOOSE,
     logger=None,
 ) -> MotionPlanRequest:
-    """Build a MotionPlanRequest moving *group_name*'s EE link to a Cartesian pose.
+    """
+    Build a MotionPlanRequest moving *group_name*'s EE link to a Cartesian pose.
 
     Modular counterpart to ``_named_target_request`` for the Phase 7 pose-targeted
     grasp path. The goal is a single ``Constraints`` block carrying:
@@ -466,7 +471,8 @@ class GraspServer(Node):
     # ------------------------------------------------------------------
 
     async def _execute_move_request(self, req: MotionPlanRequest, label: str) -> bool:
-        """Send a MotionPlanRequest via the MoveGroup action and wait for the result.
+        """
+        Send a MotionPlanRequest via the MoveGroup action and wait for the result.
 
         Reused by the legacy named-target path and the Phase 7 pose-target path so
         the goal-send / result-wait / error-code handling lives in exactly one
@@ -577,7 +583,8 @@ class GraspServer(Node):
         self.get_logger().info(f"Stage: {stage}")
 
     async def _command_gripper(self, width: float, effort: float) -> bool:
-        """Send a GripperCommand action goal.
+        """
+        Send a GripperCommand action goal.
 
         Returns True if the action server accepted the goal and returned a
         result (stall or success); False if the server is absent — the
@@ -630,7 +637,8 @@ class GraspServer(Node):
     async def _move_to_pose(
         self, pose_stamped: PoseStamped, label: str, p: _GraspParams
     ) -> bool:
-        """Plan and execute arm motion so EE_LINK reaches *pose_stamped*.
+        """
+        Plan and execute arm motion so EE_LINK reaches *pose_stamped*.
 
         Pose-targeted counterpart to ``_move_to_named``; shares the same
         MoveGroup send/wait plumbing via ``_execute_move_request``.
@@ -652,7 +660,8 @@ class GraspServer(Node):
     # ------------------------------------------------------------------
 
     async def _run_preset_grasp(self, goal_handle, result, p: _GraspParams):
-        """Legacy preset grasp sequence (speed-optimised SRDF named targets).
+        """
+        Legacy preset grasp sequence (speed-optimised SRDF named targets).
 
         approach? -> pre_grasp -> open gripper -> grasp -> close gripper ->
         retreat? -> park.
@@ -729,7 +738,8 @@ class GraspServer(Node):
 
     @staticmethod
     def _offset_pose_z(pose_stamped: PoseStamped, dz: float) -> PoseStamped:
-        """Return a copy of *pose_stamped* raised by *dz* in +Z of its own frame.
+        """
+        Return a copy of *pose_stamped* raised by *dz* in +Z of its own frame.
 
         Does not mutate the input. Orientation, frame_id, and stamp are preserved.
         """
@@ -750,7 +760,8 @@ class GraspServer(Node):
         approach_height: float,
         p: _GraspParams,
     ):
-        """Pose-targeted grasp sequence.
+        """
+        Pose-targeted grasp sequence.
 
         ready (preset) -> pre_grasp (target + approach_height +Z) -> open gripper
         -> reach (target) -> close gripper -> retreat (back to pre_grasp) -> home.

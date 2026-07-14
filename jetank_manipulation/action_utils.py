@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Shared ROS plumbing for jetank_manipulation nodes.
+"""
+Shared ROS plumbing for jetank_manipulation nodes.
 
 Consolidates the action-client send/spin-until-result helpers, the SegmentSocks
 goal construction, the latched QoS profile, and the PointCloud2 -> numpy
@@ -30,7 +31,8 @@ from jetank_detection.action import SegmentSocks
 
 
 def latched_qos(depth: int = 1) -> QoSProfile:
-    """Latched (transient-local, keep-last) QoS.
+    """
+    Latched (transient-local, keep-last) QoS.
 
     Late subscribers (e.g. RViz) immediately receive the most recent message.
     """
@@ -58,7 +60,8 @@ def make_segment_goal(
 
 
 def spin_until_complete(node, future, timeout_s: float) -> bool:
-    """Block until *future* completes or *timeout_s* elapses.
+    """
+    Block until *future* completes or *timeout_s* elapses.
 
     Uses a deadline on the node clock; the surrounding MultiThreadedExecutor
     continues spinning callbacks (the caller runs in a reentrant group), so
@@ -74,7 +77,8 @@ def spin_until_complete(node, future, timeout_s: float) -> bool:
 
 
 def send_goal_and_wait(node, client, goal, timeout_s: float, label: str):
-    """Send *goal* on *client*, spin until result/timeout.
+    """
+    Send *goal* on *client*, spin until result/timeout.
 
     Returns the action Result, or None on rejection/timeout (a warning naming
     *label* is logged on the node).

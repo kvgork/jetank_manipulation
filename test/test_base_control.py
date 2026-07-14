@@ -1,4 +1,5 @@
-"""Unit tests for the pure diff-drive control law in ``base_approach_node``.
+"""
+Unit tests for the pure diff-drive control law in ``base_approach_node``.
 
 The node module imports rclpy / tf2 / ROS message packages at import time. To
 keep the *pure* control law (``approach_control``) testable in a bare

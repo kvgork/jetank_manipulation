@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Launch the GraspObject action server with grasp_poses.yaml parameters.
+"""
+Launch the GraspObject action server with grasp_poses.yaml parameters.
 
 Usage:
     ros2 launch jetank_manipulation grasp.launch.py

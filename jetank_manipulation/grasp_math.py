@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Pure grasp math for the JeTank arm — no ROS types, unit-testable.
+"""
+Pure grasp math for the JeTank arm — no ROS types, unit-testable.
 
 Shared by ``grasp_pose_node`` (Trigger-driven grasp-pose planner / debug tool)
 and ``mobile_grasp_coordinator`` (Phase 7 mobile-manipulation FSM) so the
@@ -22,7 +23,8 @@ import numpy as np
 
 
 def wrap_to_half_pi(angle: float) -> float:
-    """Wrap an angle into (-pi/2, pi/2].
+    """
+    Wrap an angle into (-pi/2, pi/2].
 
     A grasp yaw and yaw+pi command an identical (symmetric) gripper opening, so
     we normalise into a half-open quadrant to keep the value sane/comparable.
@@ -35,7 +37,8 @@ def wrap_to_half_pi(angle: float) -> float:
 
 
 def pca_long_axis_yaw(points_xy: np.ndarray) -> Optional[float]:
-    """Return the angle (rad) of the principal (longest) axis of an XY cloud.
+    """
+    Return the angle (rad) of the principal (longest) axis of an XY cloud.
 
     ``points_xy`` is an (N, 2) array. Returns ``atan2(v_y, v_x)`` of the
     eigenvector with the largest eigenvalue of the XY covariance, or ``None``
@@ -68,7 +71,8 @@ def compute_grasp_fields(
     approach_z_offset: float = 0.0,
     default_yaw: float = 0.0,
 ) -> Tuple[Tuple[float, float, float], float]:
-    """Compute the grasp position (x, y, z) and yaw (rad) for a top-down grasp.
+    """
+    Compute the grasp position (x, y, z) and yaw (rad) for a top-down grasp.
 
     Pure function — no ROS types — so it is trivially unit-testable.
 
@@ -96,6 +100,7 @@ def compute_grasp_fields(
     -------
     ((x, y, z), yaw)
         Position in the target frame and grasp yaw about the target-frame Z.
+
     """
     cx, cy, cz = (float(centroid[0]), float(centroid[1]), float(centroid[2]))
 
@@ -122,7 +127,8 @@ def compute_grasp_fields(
 
 
 def top_down_quaternion(yaw: float) -> Tuple[float, float, float, float]:
-    """Quaternion (x, y, z, w) for a top-down grasp at the given yaw.
+    """
+    Quaternion (x, y, z, w) for a top-down grasp at the given yaw.
 
     The orientation is the composition (target-frame Z yaw) * (roll = pi about
     X). The roll-pi flips the tool's +Z to point DOWN (approach along the

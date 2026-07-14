@@ -1,4 +1,5 @@
-"""Import + pure-logic tests for jetank_manipulation.grasp_server.
+"""
+Import + pure-logic tests for jetank_manipulation.grasp_server.
 
 These tests load the *source* ``grasp_server.py`` directly by file path and
 exercise its pure logic — the SRDF named-target table and the
@@ -166,8 +167,12 @@ EXPECTED_STATES = {
 
 
 def test_srdf_states_exact_values():
-    """Joint targets must match jetank.srdf, except the documented
-    hardware-tuned grasp_reach S2 floor-reach override (105 deg)."""
+    """
+    Verify joint targets match jetank.srdf.
+
+    Exception: the documented hardware-tuned grasp_reach S2 floor-reach
+    override (105 deg).
+    """
     assert set(gs._SRDF_STATES) == set(EXPECTED_STATES)
     for state, joints in EXPECTED_STATES.items():
         assert gs._SRDF_STATES[state] == pytest.approx(joints)
@@ -417,7 +422,8 @@ def test_pose_request_workspace_is_non_degenerate():
 
 @pose_msgs
 def test_pose_request_position_only_by_default():
-    """Default (pose_use_orientation=False): 1 position_constraint, 0 orientation.
+    """
+    Default (pose_use_orientation=False): 1 position_constraint, 0 orientation.
 
     The 4-DOF arm + KDL IK cannot satisfy a full 6-DOF pose; an orientation
     constraint is the leading move_group "Catastrophic failure" cause, so the
@@ -456,7 +462,8 @@ def test_pose_request_orientation_is_unit_quaternion_when_enabled():
 
 @pose_msgs
 def test_pose_request_zero_quaternion_is_repaired_to_unit_when_enabled():
-    """The catastrophic-failure case: an all-zero orientation must not survive.
+    """
+    The catastrophic-failure case: an all-zero orientation must not survive.
 
     Only relevant when orientation is explicitly enabled; with it disabled
     (the default) there is no orientation constraint to repair.

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Shared entry-point runner for the jetank_manipulation executables.
+"""
+Shared entry-point runner for the jetank_manipulation executables.
 
 Every node in this package uses the same lifecycle: ``rclpy.init`` -> construct
 the node -> spin it on a ``MultiThreadedExecutor`` (the package-wide idiom —
@@ -15,7 +16,8 @@ from rclpy.executors import MultiThreadedExecutor
 
 
 def spin_node(node_factory, args=None) -> None:
-    """Init rclpy, spin ``node_factory()`` on a MultiThreadedExecutor, clean up.
+    """
+    Init rclpy, spin ``node_factory()`` on a MultiThreadedExecutor, clean up.
 
     ``node_factory`` is typically the Node subclass itself. KeyboardInterrupt
     exits quietly; shutdown is guarded because the context may already have
