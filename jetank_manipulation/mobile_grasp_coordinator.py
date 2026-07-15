@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Mobile-manipulation grasp coordinator for the JeTank (Phase 7).
+"""
+Mobile-manipulation grasp coordinator for the JeTank (Phase 7).
 
 A *thin* state machine that ORCHESTRATES the existing modular pieces purely via
 their ROS interfaces — it owns no perception, motion or driving logic of its own.
@@ -8,7 +9,8 @@ runs:
 
   1. SEGMENT      ActionClient /segment_socks (jetank_detection/SegmentSocks)
                   with target_frame = ``target_frame`` (param). No sock -> fail.
-                  On success, build the top-down grasp PoseStamped in
+                  On success, build the top-down grasp PoseStamped (shared
+                  ``grasp_math`` pipeline: PCA long-axis yaw, top-of-blob z) in
                   ``target_frame`` (base_link) and transform it into the
                   world-fixed ``world_frame`` (param, default ``odom``); the
                   stored odom-frame pose is the grasp target captured while the
@@ -45,14 +47,7 @@ import rclpy
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
-from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import (
-    DurabilityPolicy,
-    HistoryPolicy,
-    QoSProfile,
-    ReliabilityPolicy,
-)
 
 import tf2_ros
 # Importing tf2_geometry_msgs registers the PoseStamped transform so that
@@ -65,10 +60,17 @@ from geometry_msgs.msg import PointStamped, PoseStamped, Quaternion
 from jetank_detection.action import SegmentSocks
 from jetank_manipulation.action import ApproachTarget, GraspObject
 
-# Reuse the top-down grasp orientation math from grasp_pose_node (DRY within
-# the package). top_down_quaternion(yaw) -> (x, y, z, w) with the tool +Z
-# pointing down (roll = pi) and yaw spun about the vertical approach axis.
-from jetank_manipulation.grasp_pose_node import top_down_quaternion
+# Shared helpers (DRY within the package): the action send/spin-until-result
+# plumbing and SegmentSocks goal construction live in action_utils; the
+# segment-cloud -> top-down grasp pose math lives in grasp_math (the same
+# pipeline grasp_pose_node uses).
+from jetank_manipulation.action_utils import (
+    cloud_to_xyz,
+    latched_qos,
+    make_segment_goal,
+    send_goal_and_wait,
+)
+from jetank_manipulation.grasp_math import compute_grasp_fields, top_down_quaternion
 
 
 class MobileGraspCoordinator(Node):
@@ -125,14 +127,8 @@ class MobileGraspCoordinator(Node):
         )
 
         # Latched grasp pose for RViz (optional output).
-        latched_qos = QoSProfile(
-            depth=1,
-            history=HistoryPolicy.KEEP_LAST,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-        )
         self._pose_pub = self.create_publisher(
-            PoseStamped, "~/grasp_pose", latched_qos
+            PoseStamped, "~/grasp_pose", latched_qos()
         )
 
         self._srv = self.create_service(
@@ -180,7 +176,7 @@ class MobileGraspCoordinator(Node):
         # Build the top-down grasp pose in base_link (as the GRASP step always
         # did), then remember it in the world frame while the sock is visible —
         # this is the open-loop target we'll grasp after driving up.
-        grasp_pose_base = self._make_grasp_pose(target_frame, cx, cy, cz)
+        grasp_pose_base = self._make_grasp_pose(target_frame, sock)
         grasp_pose_world = self._to_frame(grasp_pose_base, world_frame)
         if grasp_pose_world is None:
             return self._fail(
@@ -275,13 +271,13 @@ class MobileGraspCoordinator(Node):
             )
             return None
 
-        goal = SegmentSocks.Goal()
-        goal.target_frame = target_frame
-        goal.min_score = float(self.get_parameter("min_score").value)
-        goal.max_range = float(self.get_parameter("max_range").value)
-        goal.publish_debug = False
+        goal = make_segment_goal(
+            target_frame,
+            self.get_parameter("min_score").value,
+            self.get_parameter("max_range").value,
+        )
 
-        result = self._send_and_wait(self._seg_client, goal, timeout_s, "segment")
+        result = send_goal_and_wait(self, self._seg_client, goal, timeout_s, "segment")
         if result is None:
             return None
         if not result.found:
@@ -309,7 +305,9 @@ class MobileGraspCoordinator(Node):
         goal.standoff = float(standoff)
         goal.timeout = timeout_s
 
-        result = self._send_and_wait(self._approach_client, goal, timeout_s, "approach")
+        result = send_goal_and_wait(
+            self, self._approach_client, goal, timeout_s, "approach"
+        )
         if result is None:
             return False, "approach goal rejected or timed out."
         return bool(result.success), (
@@ -317,7 +315,8 @@ class MobileGraspCoordinator(Node):
         )
 
     def _grasp(self, grasp_pose):
-        """Call /grasp_object; return (ok, message).
+        """
+        Call /grasp_object; return (ok, message).
 
         grasp_pose=None -> PRESET grasp (empty target_pose: grasp_server runs its
         tuned grasp_pre/grasp_reach joint sequence). A PoseStamped -> pose-targeted.
@@ -334,20 +333,39 @@ class MobileGraspCoordinator(Node):
             goal.target_pose = grasp_pose  # pose mode; empty frame_id => preset
         goal.approach_height = 0.0  # let grasp_server use its default standoff
 
-        result = self._send_and_wait(self._grasp_client, goal, timeout_s, "grasp")
+        result = send_goal_and_wait(self, self._grasp_client, goal, timeout_s, "grasp")
         if result is None:
             return False, "grasp goal rejected or timed out."
         return bool(result.success), result.message or ""
 
-    def _make_grasp_pose(self, frame_id, cx, cy, cz) -> PoseStamped:
-        """Top-down PoseStamped at the sock centroid (yaw 0 -> pure roll-pi)."""
-        quat = top_down_quaternion(0.0)
+    def _make_grasp_pose(self, frame_id, sock) -> PoseStamped:
+        """
+        Top-down PoseStamped for *sock* via the shared grasp_math pipeline.
+
+        Uses ``compute_grasp_fields`` on the segmented cloud — the same math
+        as ``grasp_pose_node`` — so the PCA long-axis yaw and top-of-blob z
+        are no longer dropped here (this previously rebuilt the pose with a
+        hard-coded yaw of 0.0 at the centroid z). With an empty/unreadable
+        cloud it degrades to exactly that old behavior: centroid position,
+        yaw 0 (pure roll-pi).
+        """
+        centroid = (
+            sock.centroid.point.x,
+            sock.centroid.point.y,
+            sock.centroid.point.z,
+        )
+        dims = (sock.dimensions.x, sock.dimensions.y, sock.dimensions.z)
+        points = cloud_to_xyz(sock.cloud)
+
+        (gx, gy, gz), yaw = compute_grasp_fields(points, centroid, dims)
+        quat = top_down_quaternion(yaw)
+
         pose = PoseStamped()
         pose.header.frame_id = frame_id
         pose.header.stamp = self.get_clock().now().to_msg()
-        pose.pose.position.x = float(cx)
-        pose.pose.position.y = float(cy)
-        pose.pose.position.z = float(cz)
+        pose.pose.position.x = gx
+        pose.pose.position.y = gy
+        pose.pose.position.z = gz
         pose.pose.orientation = Quaternion(
             x=quat[0], y=quat[1], z=quat[2], w=quat[3]
         )
@@ -375,7 +393,8 @@ class MobileGraspCoordinator(Node):
             return None
 
     def _from_world(self, pose_world: PoseStamped, target_frame: str):
-        """Transform the stored world-frame pose into *target_frame* at latest TF.
+        """
+        Transform the stored world-frame pose into *target_frame* at latest TF.
 
         The pose is world-fixed in ``world_frame``, so we stamp it with the
         latest available time (``rclpy.time.Time(0)``) and let tf2 use the most
@@ -386,41 +405,6 @@ class MobileGraspCoordinator(Node):
         pose.header.stamp = rclpy.time.Time().to_msg()
         pose.pose = pose_world.pose
         return self._to_frame(pose, target_frame)
-
-    # ------------------------------------------------------------------
-    # Generic action send/wait (mirrors grasp_pose_node._call_segment)
-    # ------------------------------------------------------------------
-
-    def _send_and_wait(self, client, goal, timeout_s, label):
-        """Send *goal* on *client*, spin until result/timeout. Returns Result or None."""
-        send_future = client.send_goal_async(goal)
-        if not self._spin_until(send_future, timeout_s):
-            self.get_logger().warn(f"{label}: timed out waiting for goal acceptance.")
-            return None
-
-        goal_handle = send_future.result()
-        if goal_handle is None or not goal_handle.accepted:
-            self.get_logger().warn(f"{label}: goal was rejected.")
-            return None
-
-        result_future = goal_handle.get_result_async()
-        if not self._spin_until(result_future, timeout_s):
-            self.get_logger().warn(f"{label}: timed out waiting for result.")
-            return None
-
-        wrapped = result_future.result()
-        return wrapped.result if wrapped is not None else None
-
-    def _spin_until(self, future, timeout_s: float) -> bool:
-        """Block until *future* completes or *timeout_s* elapses (executor spins)."""
-        import time
-
-        deadline = self.get_clock().now().nanoseconds + int(timeout_s * 1e9)
-        while rclpy.ok() and not future.done():
-            if self.get_clock().now().nanoseconds > deadline:
-                return False
-            time.sleep(0.02)
-        return future.done()
 
     # ------------------------------------------------------------------
     # Small utilities
@@ -443,20 +427,11 @@ class MobileGraspCoordinator(Node):
 
 
 def main(args=None):
-    rclpy.init(args=args)
-    node = MobileGraspCoordinator()
-    executor = MultiThreadedExecutor()
-    executor.add_node(node)
-    try:
-        executor.spin()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        try:
-            rclpy.shutdown()
-        except Exception:
-            pass
+    # Imported at call time so bare-env tests can load this module by file
+    # path with only the imports above stubbed.
+    from jetank_manipulation.node_runner import spin_node
+
+    spin_node(MobileGraspCoordinator, args)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
-"""Unit tests for the pure grasp-pose math in ``grasp_pose_node``.
+"""
+Unit tests for the pure grasp-pose math in ``grasp_pose_node``.
 
 The node module imports rclpy / ROS message packages at import time. To keep the
 *pure* math (``compute_grasp_fields``, ``pca_long_axis_yaw``,
@@ -93,6 +94,34 @@ def _install_stubs():
         jda.SegmentSocks = type("SegmentSocks", (), {})
         jd.action = jda
 
+    # ---- jetank_manipulation.grasp_math / action_utils ----
+    # grasp_pose_node imports these package-qualified. In a bare env (no
+    # colcon build) the package is unimportable or resolves to a stub, so
+    # load the REAL source modules by file path and register them under
+    # their fully-qualified names (their own deps are stubbed above).
+    pkg_dir = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "jetank_manipulation")
+    )
+    if "jetank_manipulation" not in sys.modules:
+        try:
+            importlib.import_module("jetank_manipulation")
+        except Exception:
+            _make_stub("jetank_manipulation")
+    for sub in ("grasp_math", "action_utils"):
+        fq = f"jetank_manipulation.{sub}"
+        if fq in sys.modules:
+            continue
+        try:
+            importlib.import_module(fq)
+        except Exception:
+            spec = importlib.util.spec_from_file_location(
+                fq, os.path.join(pkg_dir, f"{sub}.py")
+            )
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[fq] = mod
+            spec.loader.exec_module(mod)
+            setattr(sys.modules["jetank_manipulation"], sub, mod)
+
 
 _install_stubs()
 
@@ -157,7 +186,7 @@ def test_pca_degenerate_returns_none():
 # ---------------------------------------------------------------------------
 
 def _elongated_x_cloud():
-    """A flat sock elongated along +x, top at z=0.20."""
+    """Build a flat sock cloud elongated along +x, top at z=0.20."""
     n = 60
     xs = np.linspace(-0.10, 0.10, n)
     ys = np.full(n, 0.0)

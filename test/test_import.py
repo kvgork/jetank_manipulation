@@ -1,4 +1,5 @@
-"""Import + pure-logic tests for jetank_manipulation.grasp_server.
+"""
+Import + pure-logic tests for jetank_manipulation.grasp_server.
 
 These tests load the *source* ``grasp_server.py`` directly by file path and
 exercise its pure logic — the SRDF named-target table and the
@@ -158,12 +159,20 @@ EXPECTED_STATES = {
     "home": {"S1_joint": 0.0, "S2_joint": 0.0, "S3_joint": 0.0, "S5_joint": 0.0},
     "ready": {"S1_joint": 0.0, "S2_joint": -0.785, "S3_joint": 1.047, "S5_joint": 0.0},
     "grasp_pre": {"S1_joint": 0.0, "S2_joint": 1.222, "S3_joint": -0.262, "S5_joint": 0.0},
-    "grasp_reach": {"S1_joint": 0.0, "S2_joint": 1.745, "S3_joint": -0.262, "S5_joint": 0.0},
+    # grasp_reach S2 deliberately deviates from jetank.srdf (1.745 / 100 deg):
+    # hardware floor-reach tuning raised it to 105 deg = 1.8326 (see 2a54b9e —
+    # 100 deg closed the gripper 8-10 cm above a floor sock).
+    "grasp_reach": {"S1_joint": 0.0, "S2_joint": 1.8326, "S3_joint": -0.262, "S5_joint": 0.0},
 }
 
 
 def test_srdf_states_exact_values():
-    """Joint targets must match the values mirrored from jetank.srdf."""
+    """
+    Verify joint targets match jetank.srdf.
+
+    Exception: the documented hardware-tuned grasp_reach S2 floor-reach
+    override (105 deg).
+    """
     assert set(gs._SRDF_STATES) == set(EXPECTED_STATES)
     for state, joints in EXPECTED_STATES.items():
         assert gs._SRDF_STATES[state] == pytest.approx(joints)
@@ -413,7 +422,8 @@ def test_pose_request_workspace_is_non_degenerate():
 
 @pose_msgs
 def test_pose_request_position_only_by_default():
-    """Default (pose_use_orientation=False): 1 position_constraint, 0 orientation.
+    """
+    Default (pose_use_orientation=False): 1 position_constraint, 0 orientation.
 
     The 4-DOF arm + KDL IK cannot satisfy a full 6-DOF pose; an orientation
     constraint is the leading move_group "Catastrophic failure" cause, so the
@@ -452,7 +462,8 @@ def test_pose_request_orientation_is_unit_quaternion_when_enabled():
 
 @pose_msgs
 def test_pose_request_zero_quaternion_is_repaired_to_unit_when_enabled():
-    """The catastrophic-failure case: an all-zero orientation must not survive.
+    """
+    The catastrophic-failure case: an all-zero orientation must not survive.
 
     Only relevant when orientation is explicitly enabled; with it disabled
     (the default) there is no orientation constraint to repair.

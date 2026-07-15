@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Diff-drive base-approach action server for the JeTank.
+"""
+Diff-drive base-approach action server for the JeTank.
 
 Hosts the ``/approach_target`` action (``jetank_manipulation/action/ApproachTarget``):
 drive the tracked base up to a point until it is ``standoff`` metres ahead, using
@@ -38,7 +39,6 @@ from typing import Tuple
 import rclpy
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.time import Time
 
@@ -78,7 +78,8 @@ def approach_control(
     max_ang: float,
     arrive_tol: float = 0.03,
 ) -> Tuple[float, float, bool]:
-    """Rotate-then-drive diff-drive servo toward a target in the base frame.
+    """
+    Rotate-then-drive diff-drive servo toward a target in the base frame.
 
     Pure function — no ROS types — so it is trivially unit-testable.
 
@@ -97,6 +98,9 @@ def approach_control(
         error) terms.
     max_lin, max_ang:
         Symmetric saturation limits for the linear / angular commands.
+    arrive_tol:
+        Extra slack (metres) added to ``standoff`` for the arrival check:
+        arrived once ``hypot(dx, dy) <= standoff + arrive_tol``.
 
     Returns
     -------
@@ -104,6 +108,7 @@ def approach_control(
         ``lin`` forward velocity (m/s), ``ang`` yaw rate (rad/s), and
         ``arrived`` True once within ``standoff`` (caller should stop + succeed).
         On arrival both ``lin`` and ``ang`` are 0.
+
     """
     dist = math.hypot(dx, dy)
     heading = math.atan2(dy, dx)
@@ -224,7 +229,6 @@ class BaseApproachNode(Node):
         deadline_ns = start_ns + int(timeout * 1e9) if timeout > 0.0 else None
 
         last_dist = float("nan")
-        rate = self.create_rate(control_rate if control_rate > 0.0 else 10.0)
 
         try:
             while rclpy.ok():
@@ -258,7 +262,7 @@ class BaseApproachNode(Node):
                 if dx_dy is None:
                     # Transient TF gap: hold still, retry next tick.
                     self._stop()
-                    self._sleep_rate(rate, period)
+                    self._sleep_period(period)
                     continue
 
                 dx, dy = dx_dy
@@ -288,7 +292,7 @@ class BaseApproachNode(Node):
                     return result
 
                 self._publish_cmd(lin, ang, base_frame)
-                self._sleep_rate(rate, period)
+                self._sleep_period(period)
 
         finally:
             # Defensive: never leave the base creeping if we exit unexpectedly.
@@ -306,7 +310,8 @@ class BaseApproachNode(Node):
     # ------------------------------------------------------------------
 
     def _snapshot_target(self, target, stable_frame, base_frame):
-        """Transform *target* once into *stable_frame* (a world-fixed frame).
+        """
+        Transform *target* once into *stable_frame* (a world-fixed frame).
 
         Returns a PointStamped in stable_frame. Falls back to the original target
         if it is already in stable_frame, or if the TF is unavailable (then the
@@ -379,12 +384,15 @@ class BaseApproachNode(Node):
         base_frame = self.get_parameter("base_frame").value
         self._publish_cmd(0.0, 0.0, base_frame)
 
-    def _sleep_rate(self, rate, period: float) -> None:
-        """Sleep one control period.
+    @staticmethod
+    def _sleep_period(period: float) -> None:
+        """
+        Sleep one control period.
 
-        Uses a plain time.sleep so the loop ticks even without a wall executor
-        thread driving Rate (Rate.sleep can deadlock on a single-thread spin);
-        the MultiThreadedExecutor keeps servicing TF / cancel concurrently.
+        Uses a plain time.sleep instead of a node Rate: Rate.sleep can deadlock
+        on a single-thread spin, and create_rate attaches a real node timer that
+        would keep firing (leak) for the life of the node. The
+        MultiThreadedExecutor keeps servicing TF / cancel concurrently.
         """
         import time
 
@@ -397,20 +405,11 @@ class BaseApproachNode(Node):
 
 
 def main(args=None):
-    rclpy.init(args=args)
-    node = BaseApproachNode()
-    executor = MultiThreadedExecutor()
-    executor.add_node(node)
-    try:
-        executor.spin()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        try:
-            rclpy.shutdown()
-        except Exception:
-            pass
+    # Imported at call time so bare-env tests can load this module by file
+    # path with only the imports above stubbed.
+    from jetank_manipulation.node_runner import spin_node
+
+    spin_node(BaseApproachNode, args)
 
 
 if __name__ == "__main__":
