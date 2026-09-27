@@ -447,6 +447,9 @@ class GraspServer(Node):
             _GRIPPER_ACTION,
             callback_group=self._cb_group,
         )
+        # Gripper action-server discovery state — see _command_gripper.
+        self._gripper_seen = False
+        self._gripper_warned = False
 
         # GraspObject action server
         self._action_server = ActionServer(
@@ -598,13 +601,26 @@ class GraspServer(Node):
         Returns True if the action server accepted the goal and returned a
         result (stall or success); False if the server is absent — the
         caller degrades gracefully and the grasp sequence continues.
+
+        Once discovery has succeeded once, ``wait_for_server`` is expected to
+        return near-instantly (the action is already known to the graph), so
+        it keeps the full timeout as a generous margin against a transient
+        blip. Until then — e.g. the controller is not yet spawned/active —
+        every goal calls this twice (open + close), so a full 5 s timeout on
+        each burns 10 s/goal; use a short timeout instead and retry on the
+        next call rather than caching a permanent negative result. The
+        "not available" warning itself is logged only once, not once per call.
         """
-        if not self._gripper_client.wait_for_server(timeout_sec=5.0):
-            self.get_logger().warn(
-                f"GripperCommand action server {_GRIPPER_ACTION} not available — "
-                "skipping gripper command."
-            )
+        timeout_s = 5.0 if self._gripper_seen else 0.2
+        if not self._gripper_client.wait_for_server(timeout_sec=timeout_s):
+            if not self._gripper_warned:
+                self.get_logger().warn(
+                    f"GripperCommand action server {_GRIPPER_ACTION} not "
+                    "available — skipping gripper command(s) until it appears."
+                )
+                self._gripper_warned = True
             return False
+        self._gripper_seen = True
 
         gripper_goal = GripperCommand.Goal()
         gripper_goal.command.position = width
