@@ -157,36 +157,43 @@ def test_module_constants():
 
 
 # ---------------------------------------------------------------------------
-# _SRDF_STATES table
+# _get_srdf_states() -- parsed straight from jetank_moveit_config/config/
+# jetank.srdf (the 'arm' group's <group_state> elements), replacing the old
+# hand-maintained _SRDF_STATES mirror that had already drifted (it carried a
+# stale S5_joint=0.0 in every state; the SRDF's 'arm' group is S1/S2/S3 only).
 # ---------------------------------------------------------------------------
 
+# These must match jetank_moveit_config/config/jetank.srdf's own group_state
+# values exactly -- there is only one source of truth now, so this table
+# exists purely to pin the expected *content*, not to configure anything.
 EXPECTED_STATES = {
-    "home": {"S1_joint": 0.0, "S2_joint": 0.0, "S3_joint": 0.0, "S5_joint": 0.0},
-    "ready": {"S1_joint": 0.0, "S2_joint": -0.785, "S3_joint": 1.047, "S5_joint": 0.0},
-    "grasp_pre": {"S1_joint": 0.0, "S2_joint": 1.222, "S3_joint": -0.262, "S5_joint": 0.0},
-    # grasp_reach S2 deliberately deviates from jetank.srdf (1.745 / 100 deg):
-    # hardware floor-reach tuning raised it to 105 deg = 1.8326 (see 2a54b9e —
-    # 100 deg closed the gripper 8-10 cm above a floor sock).
-    "grasp_reach": {"S1_joint": 0.0, "S2_joint": 1.8326, "S3_joint": -0.262, "S5_joint": 0.0},
+    "home": {"S1_joint": 0.0, "S2_joint": 0.0, "S3_joint": 0.0},
+    "ready": {"S1_joint": 0.0, "S2_joint": -0.785, "S3_joint": 1.047},
+    # Not previously reachable through grasp_server: the old hand-maintained
+    # _SRDF_STATES mirror never carried it, only the SRDF itself did.
+    "vertical": {"S1_joint": 0.0, "S2_joint": -1.57, "S3_joint": 0.0},
+    "grasp_pre": {"S1_joint": 0.0, "S2_joint": 1.222, "S3_joint": -0.262},
+    "grasp_reach": {"S1_joint": 0.0, "S2_joint": 1.8326, "S3_joint": -0.262},
 }
 
 
 def test_srdf_states_exact_values():
-    """
-    Verify joint targets match jetank.srdf.
-
-    Exception: the documented hardware-tuned grasp_reach S2 floor-reach
-    override (105 deg).
-    """
-    assert set(gs._SRDF_STATES) == set(EXPECTED_STATES)
+    """Verify joint targets parsed from the SRDF match the expected table."""
+    states = gs._get_srdf_states()
+    assert set(states) == set(EXPECTED_STATES)
     for state, joints in EXPECTED_STATES.items():
-        assert gs._SRDF_STATES[state] == pytest.approx(joints)
+        assert states[state] == pytest.approx(joints)
 
 
-def test_every_state_has_four_dof():
-    """All arm group_states cover exactly the 4 actuated joints."""
-    for joints in gs._SRDF_STATES.values():
-        assert set(joints) == {"S1_joint", "S2_joint", "S3_joint", "S5_joint"}
+def test_every_state_has_three_dof():
+    """All 'arm' group_states cover exactly the 3 actuated joints (S1/S2/S3).
+
+    S5 is a torque-held hardware joint, never part of the 'arm' SRDF group --
+    a state carrying it (as the old hand-maintained mirror did) would put a
+    JointConstraint on a joint outside the planning group.
+    """
+    for joints in gs._get_srdf_states().values():
+        assert set(joints) == {"S1_joint", "S2_joint", "S3_joint"}
 
 
 def test_config_yaml_named_targets_resolve():
@@ -195,10 +202,11 @@ def test_config_yaml_named_targets_resolve():
         os.path.join(os.path.dirname(__file__), "..", "config", "grasp_poses.yaml")
     )
     text = open(cfg, encoding="utf-8").read()
+    states = gs._get_srdf_states()
     # The yaml lists approach/pre_grasp/grasp/retreat/park under arm_targets.
     for name in ("grasp_pre", "grasp_reach", "home"):
         assert f'"{name}"' in text
-        assert name in gs._SRDF_STATES
+        assert name in states
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +246,7 @@ def test_request_joint_constraints_match_srdf():
     """One JointConstraint per DOF, with the exact SRDF position and tolerances."""
     req = _build("grasp_reach")
     jcs = req.goal_constraints[0].joint_constraints
-    expected = gs._SRDF_STATES["grasp_reach"]
+    expected = gs._get_srdf_states()["grasp_reach"]
     assert len(jcs) == len(expected)
 
     by_name = {jc.joint_name: jc for jc in jcs}

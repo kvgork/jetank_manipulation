@@ -22,8 +22,15 @@ Usage:
 """
 
 import math
+import os
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+
+try:
+    from ament_index_python.packages import get_package_share_directory
+except ImportError:  # pragma: no cover - only in a bare test env, see _srdf_path()
+    get_package_share_directory = None
 
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -75,9 +82,13 @@ _GRIPPER_ACTION = "/gripper_controller/gripper_cmd"
 ARM_GROUP = "arm"
 PLANNER_ID = "RRTConnect"
 
-# End-effector link of the 'arm' group (chain base_link -> S5_link). Pose-targeted
-# grasps constrain THIS link to the requested target pose.
-EE_LINK = "S5_link"
+# End-effector link of the 'arm' group (chain base_link -> S4_link; see
+# jetank_moveit_config/config/jetank.srdf, which planning group 'arm' and its
+# end_effector both use S4_link as the tip -- S5 is a torque-held hardware
+# joint that stays outside the group). Pose-targeted grasps constrain THIS
+# link to the requested target pose; S5_link is not part of the 'arm' group's
+# kinematic chain, so MoveIt cannot resolve it as a planning-frame link.
+EE_LINK = "S4_link"
 
 # The 4-DOF arm (S1 yaw, S2/S3 pitch, S5 wrist) cannot achieve an arbitrary
 # end-effector orientation. We therefore treat the requested orientation as a
@@ -151,9 +162,9 @@ def _named_target_request(
 
     The MoveGroup action goal only accepts explicit joint values or Cartesian
     poses (named-target resolution lives in a separate move_group service, not
-    the action). Without moveit_py we therefore embed the known SRDF joint
-    values (``_SRDF_STATES``) directly as per-DOF JointConstraints, keeping the
-    node self-contained.
+    the action). Without moveit_py we therefore read the SRDF's own
+    ``group_state`` joint values (see ``_get_srdf_states()``) and embed them
+    directly as per-DOF JointConstraints, keeping the node self-contained.
 
     *planning_frame* stamps the workspace_parameters sampling box. It must
     match the SRDF virtual_joint's parent frame (jetank_moveit_config/config/
@@ -169,11 +180,13 @@ def _named_target_request(
     req.max_acceleration_scaling_factor = acc_scale
     req.workspace_parameters.header.frame_id = planning_frame
 
-    # Named target joint values from jetank.srdf — kept in sync manually.
-    # If the SRDF changes, update _SRDF_STATES below.
-    joint_targets = _SRDF_STATES.get(named_target)
+    # Named target joint values, read straight from jetank.srdf's own
+    # group_state elements (see _get_srdf_states()) instead of a
+    # hand-maintained copy.
+    srdf_states = _get_srdf_states()
+    joint_targets = srdf_states.get(named_target)
     if joint_targets is None:
-        raise ValueError(f"Unknown SRDF state: {named_target!r}. Known: {list(_SRDF_STATES)}")
+        raise ValueError(f"Unknown SRDF state: {named_target!r}. Known: {list(srdf_states)}")
 
     c = Constraints()
     c.name = named_target
@@ -343,42 +356,77 @@ def _pose_target_request(
     return req
 
 
-# SRDF arm group_state joint values (mirror of jetank_moveit_config/config/jetank.srdf).
-# Update here if the SRDF changes.
-_SRDF_STATES: dict = {
-    "home": {
-        "S1_joint": 0.0,
-        "S2_joint": 0.0,
-        "S3_joint": 0.0,
-        "S5_joint": 0.0,
-    },
-    "ready": {
-        "S1_joint": 0.0,
-        "S2_joint": -0.785,
-        "S3_joint": 1.047,
-        "S5_joint": 0.0,
-    },
-    # Forward grasp poses, tuned from RViz (degrees -> rad):
-    #   grasp_reach: S2=105deg=1.8326, S3=-15deg=-0.262 — reaches floor level.
-    #     S2=100deg/1.745 left the gripper ~8-10 cm ABOVE a floor sock (claws shut
-    #     in the air above it). S2>=107deg drives the gripper INTO the floor and
-    #     the trajectory controller TIMED_OUT / CONTROL_FAILED (jammed target).
-    #     105deg completes cleanly (swept 110->100 by 1deg; 106 also worked, 105
-    #     kept for margin). Re-tune here if the floor height changes.
-    #   grasp_pre:   derived raised approach (S2=70deg=1.222, same S3)
-    "grasp_pre": {
-        "S1_joint": 0.0,
-        "S2_joint": 1.222,
-        "S3_joint": -0.262,
-        "S5_joint": 0.0,
-    },
-    "grasp_reach": {
-        "S1_joint": 0.0,
-        "S2_joint": 1.8326,
-        "S3_joint": -0.262,
-        "S5_joint": 0.0,
-    },
-}
+# SRDF arm group_state joint values.
+#
+# Previously a hand-maintained mirror of jetank_moveit_config/config/jetank.srdf
+# (updated here whenever the SRDF changed) -- it had already drifted: it
+# carried an S5_joint=0.0 entry in every state even though jetank.srdf's 'arm'
+# group is base_link->S4_link (S1/S2/S3 only; S5 stays a hardware-only joint,
+# never part of MoveIt planning). Read the SRDF itself instead, so there is
+# exactly one source of truth and this can no longer silently fall out of
+# sync with it. See _get_srdf_states() / _srdf_path() below.
+#
+# Forward grasp poses, tuned from RViz (degrees -> rad), for reference:
+#   grasp_reach: S2=105deg=1.8326, S3=-15deg=-0.262 — reaches floor level.
+#     S2=100deg/1.745 left the gripper ~8-10 cm ABOVE a floor sock (claws shut
+#     in the air above it). S2>=107deg drives the gripper INTO the floor and
+#     the trajectory controller TIMED_OUT / CONTROL_FAILED (jammed target).
+#     105deg completes cleanly (swept 110->100 by 1deg; 106 also worked, 105
+#     kept for margin). Re-tune in jetank.srdf if the floor height changes.
+#   grasp_pre:   derived raised approach (S2=70deg=1.222, same S3)
+
+
+def _srdf_path() -> str:
+    """
+    Return the on-disk path of jetank_moveit_config/config/jetank.srdf.
+
+    Prefers the installed package share directory (ament_index, the normal
+    runtime path); falls back to the sibling-package source path so this
+    still resolves in a bare source checkout with no colcon build (that's
+    how test_import.py loads this module -- see its module docstring).
+    """
+    if get_package_share_directory is not None:
+        try:
+            return os.path.join(
+                get_package_share_directory('jetank_moveit_config'),
+                'config', 'jetank.srdf',
+            )
+        except Exception:
+            pass  # package not built/sourced -- fall through to the source path
+    return os.path.abspath(os.path.join(
+        os.path.dirname(__file__), '..', '..',
+        'jetank_moveit_config', 'config', 'jetank.srdf',
+    ))
+
+
+_srdf_states_cache = None
+
+
+def _get_srdf_states(srdf_path: str = None) -> dict:
+    """
+    Return ``{state_name: {joint_name: value}}`` for the ``arm`` group's
+    ``<group_state>`` elements in jetank.srdf.
+
+    Cached after the first call (with the default path) since the SRDF does
+    not change at runtime. Pass an explicit *srdf_path* (bypassing the cache)
+    to parse a specific file, e.g. from a test.
+    """
+    global _srdf_states_cache
+    if srdf_path is None and _srdf_states_cache is not None:
+        return _srdf_states_cache
+    path = srdf_path if srdf_path is not None else _srdf_path()
+    root = ET.parse(path).getroot()
+    states = {}
+    for state_el in root.findall('group_state'):
+        if state_el.get('group') != ARM_GROUP:
+            continue
+        states[state_el.get('name')] = {
+            joint_el.get('name'): float(joint_el.get('value'))
+            for joint_el in state_el.findall('joint')
+        }
+    if srdf_path is None:
+        _srdf_states_cache = states
+    return states
 
 
 # ---------------------------------------------------------------------------
