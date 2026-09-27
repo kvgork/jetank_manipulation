@@ -42,6 +42,7 @@ Usage:
 """
 
 import math
+from copy import deepcopy
 
 import rclpy
 from rclpy.action import ActionClient
@@ -107,8 +108,15 @@ class MobileGraspCoordinator(Node):
         # (~47 Hz) measured ~14% CPU idle with nothing to look up. All TF use is
         # confined to _on_trigger's call tree (_to_frame/_from_world), so this
         # changes no lookup behaviour.
-        self._tf_buffer = None
-        self._tf_listener = None
+        #
+        # The buffer/listener are kept as LOCAL variables in _on_trigger (never
+        # stored on self): the Trigger service runs under a
+        # MultiThreadedExecutor/ReentrantCallbackGroup, so two overlapping
+        # ~/execute_sock_grasp calls are possible. Storing them on self and
+        # tearing down via `self._tf_listener`/`self._tf_buffer` in `finally`
+        # would let whichever call finished first null out the OTHER, still
+        # running call's buffer (its next TF lookup then hits `None.transform`
+        # -> AttributeError) while leaking the finishing call's own listener.
 
         # World-fixed grasp pose captured during SEGMENT (PoseStamped in
         # world_frame), retrieved into target_frame at GRASP time.
@@ -153,17 +161,20 @@ class MobileGraspCoordinator(Node):
     # ------------------------------------------------------------------
 
     def _on_trigger(self, _request, response):
-        """Create the TF listener for this call's duration, then run it."""
-        self._tf_buffer = tf2_ros.Buffer()
-        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
-        try:
-            return self._on_trigger_impl(_request, response)
-        finally:
-            self._tf_listener.unregister()
-            self._tf_listener = None
-            self._tf_buffer = None
+        """Create the TF listener for this call's duration, then run it.
 
-    def _on_trigger_impl(self, _request, response):
+        `tf_buffer`/`tf_listener` are local to this invocation and passed
+        down explicitly (see the note in __init__) so a concurrent call's
+        teardown can never touch this call's buffer.
+        """
+        tf_buffer = tf2_ros.Buffer()
+        tf_listener = tf2_ros.TransformListener(tf_buffer, self)
+        try:
+            return self._on_trigger_impl(_request, response, tf_buffer)
+        finally:
+            tf_listener.unregister()
+
+    def _on_trigger_impl(self, _request, response, tf_buffer):
         target_frame = self.get_parameter("target_frame").value
         world_frame = self.get_parameter("world_frame").value
         arm_reach = float(self.get_parameter("arm_reach").value)
@@ -194,7 +205,7 @@ class MobileGraspCoordinator(Node):
         # did), then remember it in the world frame while the sock is visible —
         # this is the open-loop target we'll grasp after driving up.
         grasp_pose_base = self._make_grasp_pose(target_frame, sock)
-        grasp_pose_world = self._to_frame(grasp_pose_base, world_frame)
+        grasp_pose_world = self._to_frame(grasp_pose_base, world_frame, tf_buffer)
         if grasp_pose_world is None:
             return self._fail(
                 response,
@@ -243,7 +254,9 @@ class MobileGraspCoordinator(Node):
         else:
             # 'pose' mode (e.g. elevated/reachable targets): recover the remembered
             # world-frame grasp pose into base_link and send it as target_pose.
-            grasp_pose = self._from_world(self._grasp_pose_world, target_frame)
+            grasp_pose = self._from_world(
+                self._grasp_pose_world, target_frame, tf_buffer
+            )
             if grasp_pose is None:
                 return self._fail(
                     response,
@@ -392,12 +405,30 @@ class MobileGraspCoordinator(Node):
     # TF helpers (store grasp pose in world_frame; retrieve into base_link)
     # ------------------------------------------------------------------
 
-    def _to_frame(self, pose: PoseStamped, target_frame: str):
-        """Transform *pose* into *target_frame* at its own stamp; None on failure."""
+    def _to_frame(self, pose: PoseStamped, target_frame: str, tf_buffer):
+        """
+        Transform *pose* into *target_frame* at the LATEST available TF.
+
+        Same lazy-listener pattern as base_approach_node._snapshot_target: the
+        buffer/listener are created fresh at the top of _on_trigger, and this
+        can fire almost immediately afterwards (SEGMENT builds `pose` with a
+        `now()` stamp right before calling this) -- a lookup at that own stamp
+        can race a still-cold buffer that has not yet ingested a /tf message at
+        or after it, raising ExtrapolationException. We assume the robot is
+        stationary across this single TF hop (captured back-to-back within one
+        trigger call), so looking up "latest" instead of the original stamp is
+        equivalent in practice. None on failure (including the transform never
+        becoming available within timeout).
+        """
+        timeout = Duration(seconds=0.5)
         try:
-            return self._tf_buffer.transform(
-                pose, target_frame, timeout=Duration(seconds=0.5)
+            tf_buffer.can_transform(
+                target_frame, pose.header.frame_id, rclpy.time.Time(),
+                timeout=timeout,
             )
+            snap_request = deepcopy(pose)
+            snap_request.header.stamp = rclpy.time.Time().to_msg()
+            return tf_buffer.transform(snap_request, target_frame, timeout=timeout)
         except (
             tf2_ros.LookupException,
             tf2_ros.ConnectivityException,
@@ -409,7 +440,7 @@ class MobileGraspCoordinator(Node):
             )
             return None
 
-    def _from_world(self, pose_world: PoseStamped, target_frame: str):
+    def _from_world(self, pose_world: PoseStamped, target_frame: str, tf_buffer):
         """
         Transform the stored world-frame pose into *target_frame* at latest TF.
 
@@ -421,7 +452,7 @@ class MobileGraspCoordinator(Node):
         pose.header.frame_id = pose_world.header.frame_id
         pose.header.stamp = rclpy.time.Time().to_msg()
         pose.pose = pose_world.pose
-        return self._to_frame(pose, target_frame)
+        return self._to_frame(pose, target_frame, tf_buffer)
 
     # ------------------------------------------------------------------
     # Small utilities
