@@ -70,7 +70,7 @@ _MOVE_ACTION = "/move_action"
 # (moveit_sim.launch.py + gz_ros2_control, which namespaces controllers
 # correctly and is NOT affected) -- can override back to the per-controller
 # name without a code change.
-_GRIPPER_ACTION = "/controller_manager/gripper_cmd"
+_GRIPPER_ACTION = "/gripper_controller/gripper_cmd"
 
 ARM_GROUP = "arm"
 PLANNER_ID = "RRTConnect"

@@ -153,7 +153,7 @@ def test_module_constants():
     # same controller_manager 2.54/2.53.1 version skew for move_group's own
     # clients); NOT the per-controller name a naive reading of
     # jetank_controllers.yaml/moveit_controllers.yaml would suggest.
-    assert gs._GRIPPER_ACTION == "/controller_manager/gripper_cmd"
+    assert gs._GRIPPER_ACTION == "/gripper_controller/gripper_cmd"
 
 
 # ---------------------------------------------------------------------------
