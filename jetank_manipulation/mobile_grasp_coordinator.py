@@ -101,8 +101,14 @@ class MobileGraspCoordinator(Node):
 
         # TF: capture the grasp pose in world_frame while the sock is visible,
         # then retrieve it back into target_frame after the base has driven up.
-        self._tf_buffer = tf2_ros.Buffer()
-        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+        # The buffer/listener are created lazily, only for the duration of an
+        # active ~/execute_sock_grasp call (see _on_trigger), instead of for the
+        # node's whole lifetime: the Python callback ingesting every /tf message
+        # (~47 Hz) measured ~14% CPU idle with nothing to look up. All TF use is
+        # confined to _on_trigger's call tree (_to_frame/_from_world), so this
+        # changes no lookup behaviour.
+        self._tf_buffer = None
+        self._tf_listener = None
 
         # World-fixed grasp pose captured during SEGMENT (PoseStamped in
         # world_frame), retrieved into target_frame at GRASP time.
@@ -147,6 +153,17 @@ class MobileGraspCoordinator(Node):
     # ------------------------------------------------------------------
 
     def _on_trigger(self, _request, response):
+        """Create the TF listener for this call's duration, then run it."""
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+        try:
+            return self._on_trigger_impl(_request, response)
+        finally:
+            self._tf_listener.unregister()
+            self._tf_listener = None
+            self._tf_buffer = None
+
+    def _on_trigger_impl(self, _request, response):
         target_frame = self.get_parameter("target_frame").value
         world_frame = self.get_parameter("world_frame").value
         arm_reach = float(self.get_parameter("arm_reach").value)
