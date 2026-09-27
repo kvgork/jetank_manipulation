@@ -148,7 +148,12 @@ def test_module_constants():
     assert gs.ARM_GROUP == "arm"
     assert gs.PLANNER_ID == "RRTConnect"
     assert gs._MOVE_ACTION == "/move_action"
-    assert gs._GRIPPER_ACTION == "/gripper_controller/gripper_cmd"
+    # Default is the REAL endpoint on this build's standalone-controller_manager
+    # launch path (moveit_bringup.launch.py's action_remaps work around the
+    # same controller_manager 2.54/2.53.1 version skew for move_group's own
+    # clients); NOT the per-controller name a naive reading of
+    # jetank_controllers.yaml/moveit_controllers.yaml would suggest.
+    assert gs._GRIPPER_ACTION == "/controller_manager/gripper_cmd"
 
 
 # ---------------------------------------------------------------------------

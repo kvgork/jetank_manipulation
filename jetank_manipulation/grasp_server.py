@@ -9,8 +9,11 @@ arm motion through the MoveGroup action (moveit_msgs/action/MoveGroup) directly.
 Sequence:
   ready -> grasp_pre -> open gripper -> grasp_reach -> close gripper -> ready -> home
 
-Gripper is commanded via control_msgs/action/GripperCommand on
-/gripper_controller/gripper_cmd (GripperActionController).
+Gripper is commanded via control_msgs/action/GripperCommand, action name given
+by the ``gripper_action`` parameter (default ``/controller_manager/gripper_cmd``
+-- see the ``_GRIPPER_ACTION`` note below for why that, and not the
+seemingly-obvious ``/gripper_controller/gripper_cmd``, is the real endpoint on
+this build's standalone-controller_manager launch path).
 gripper_right_joint is mirrored by the ros2_control native mimic mechanism.
 
 Usage:
@@ -48,7 +51,26 @@ from jetank_manipulation.action import GraspObject
 # ---------------------------------------------------------------------------
 
 _MOVE_ACTION = "/move_action"
-_GRIPPER_ACTION = "/gripper_controller/gripper_cmd"
+# GripperActionController (position_controllers/GripperActionController,
+# jetank_motor_control/config/jetank_controllers.yaml) exposes its action at
+# `<controller_name>/gripper_cmd`, so the "obvious" name is
+# /gripper_controller/gripper_cmd (jetank_moveit_config/config/
+# moveit_controllers.yaml: action_ns "gripper_cmd" under controller
+# "gripper_controller"). But on THIS build's standalone-controller_manager
+# launch path (jetank_moveit_config/launch/moveit_bringup.launch.py, used for
+# both hardware:=mock and hardware:=serial -- i.e. the mock stack AND real
+# hardware bring-up), a controller_manager 2.54 / controllers 2.53.1 version
+# skew makes every controller collapse onto the `controller_manager` node
+# instead of registering its own node name, so action servers come up at
+# /controller_manager/<action> rather than /<controller_name>/<action>.
+# moveit_bringup.launch.py works around exactly this for move_group's own
+# clients (see its `_action_remaps`); grasp_server's separate GripperCommand
+# client needs the same real name. Parameterised (see `gripper_action` below)
+# so a future coherent ros2_control snapshot -- or the sim path
+# (moveit_sim.launch.py + gz_ros2_control, which namespaces controllers
+# correctly and is NOT affected) -- can override back to the per-controller
+# name without a code change.
+_GRIPPER_ACTION = "/controller_manager/gripper_cmd"
 
 ARM_GROUP = "arm"
 PLANNER_ID = "RRTConnect"
@@ -427,6 +449,12 @@ class GraspServer(Node):
         # MoveIt planning frame (jetank.srdf virtual_joint parent_frame). Matches
         # mobile_grasp_coordinator's "world_frame" param default.
         self.declare_parameter("planning_frame", "odom")
+        # GripperCommand action name. Default is the REAL endpoint on this
+        # build's standalone-controller_manager launch path; see the
+        # _GRIPPER_ACTION comment above. Override to
+        # "/gripper_controller/gripper_cmd" for the sim path or once a
+        # coherent ros2_control snapshot restores per-controller node names.
+        self.declare_parameter("gripper_action", _GRIPPER_ACTION)
 
         self._cb_group = ReentrantCallbackGroup()
 
@@ -440,11 +468,13 @@ class GraspServer(Node):
 
         # GripperCommand action client
         # Replaces Float64MultiArray publisher — sends GripperCommand goals to
-        # GripperActionController at /gripper_controller/gripper_cmd.
+        # GripperActionController at the resolved `gripper_action` name (see
+        # the _GRIPPER_ACTION / parameter comments above).
+        self._gripper_action = self.get_parameter("gripper_action").value
         self._gripper_client = ActionClient(
             self,
             GripperCommand,
-            _GRIPPER_ACTION,
+            self._gripper_action,
             callback_group=self._cb_group,
         )
         # Gripper action-server discovery state — see _command_gripper.
@@ -615,7 +645,7 @@ class GraspServer(Node):
         if not self._gripper_client.wait_for_server(timeout_sec=timeout_s):
             if not self._gripper_warned:
                 self.get_logger().warn(
-                    f"GripperCommand action server {_GRIPPER_ACTION} not "
+                    f"GripperCommand action server {self._gripper_action} not "
                     "available — skipping gripper command(s) until it appears."
                 )
                 self._gripper_warned = True
