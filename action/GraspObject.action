@@ -3,7 +3,7 @@ string object_hint   # unused in Phase 1 (open-loop preset grasp); reserved for 
 
 # Phase 7: pose-targeted grasp.
 # If target_pose.header.frame_id is non-empty, grasp_server plans the 'arm'
-# group so S5_link/gripper_ee reaches this pose (position + best-effort
+# group so S4_link/gripper_ee reaches this pose (position + best-effort
 # top-down yaw). If empty, the legacy preset (SRDF named-target) grasp runs.
 geometry_msgs/PoseStamped target_pose
 

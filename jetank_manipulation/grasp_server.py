@@ -9,8 +9,11 @@ arm motion through the MoveGroup action (moveit_msgs/action/MoveGroup) directly.
 Sequence:
   ready -> grasp_pre -> open gripper -> grasp_reach -> close gripper -> ready -> home
 
-Gripper is commanded via control_msgs/action/GripperCommand on
-/gripper_controller/gripper_cmd (GripperActionController).
+Gripper is commanded via control_msgs/action/GripperCommand, action name given
+by the ``gripper_action`` parameter (default ``/gripper_controller/gripper_cmd``,
+the per-controller name served in sim). On hardware the launch overrides it to
+``/controller_manager/gripper_cmd`` -- see the ``_GRIPPER_ACTION`` note below for
+why that is the real endpoint on the standalone-controller_manager launch path).
 gripper_right_joint is mirrored by the ros2_control native mimic mechanism.
 
 Usage:
@@ -19,8 +22,15 @@ Usage:
 """
 
 import math
+import os
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+
+try:
+    from ament_index_python.packages import get_package_share_directory
+except ImportError:  # pragma: no cover - only in a bare test env, see _srdf_path()
+    get_package_share_directory = None
 
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -48,14 +58,37 @@ from jetank_manipulation.action import GraspObject
 # ---------------------------------------------------------------------------
 
 _MOVE_ACTION = "/move_action"
+# GripperActionController (position_controllers/GripperActionController,
+# jetank_motor_control/config/jetank_controllers.yaml) exposes its action at
+# `<controller_name>/gripper_cmd`, so the "obvious" name is
+# /gripper_controller/gripper_cmd (jetank_moveit_config/config/
+# moveit_controllers.yaml: action_ns "gripper_cmd" under controller
+# "gripper_controller"). But on THIS build's standalone-controller_manager
+# launch path (jetank_moveit_config/launch/moveit_bringup.launch.py, used for
+# both hardware:=mock and hardware:=serial -- i.e. the mock stack AND real
+# hardware bring-up), a controller_manager 2.54 / controllers 2.53.1 version
+# skew makes every controller collapse onto the `controller_manager` node
+# instead of registering its own node name, so action servers come up at
+# /controller_manager/<action> rather than /<controller_name>/<action>.
+# moveit_bringup.launch.py works around exactly this for move_group's own
+# clients (see its `_action_remaps`); grasp_server's separate GripperCommand
+# client needs the same real name. Parameterised (see `gripper_action` below)
+# so a future coherent ros2_control snapshot -- or the sim path
+# (moveit_sim.launch.py + gz_ros2_control, which namespaces controllers
+# correctly and is NOT affected) -- can override back to the per-controller
+# name without a code change.
 _GRIPPER_ACTION = "/gripper_controller/gripper_cmd"
 
 ARM_GROUP = "arm"
 PLANNER_ID = "RRTConnect"
 
-# End-effector link of the 'arm' group (chain base_link -> S5_link). Pose-targeted
-# grasps constrain THIS link to the requested target pose.
-EE_LINK = "S5_link"
+# End-effector link of the 'arm' group (chain base_link -> S4_link; see
+# jetank_moveit_config/config/jetank.srdf, which planning group 'arm' and its
+# end_effector both use S4_link as the tip -- S5 is a torque-held hardware
+# joint that stays outside the group). Pose-targeted grasps constrain THIS
+# link to the requested target pose; S5_link is not part of the 'arm' group's
+# kinematic chain, so MoveIt cannot resolve it as a planning-frame link.
+EE_LINK = "S4_link"
 
 # The 4-DOF arm (S1 yaw, S2/S3 pitch, S5 wrist) cannot achieve an arbitrary
 # end-effector orientation. We therefore treat the requested orientation as a
@@ -122,15 +155,21 @@ def _named_target_request(
     num_attempts: int,
     vel_scale: float,
     acc_scale: float,
+    planning_frame: str = "odom",
 ) -> MotionPlanRequest:
     """
     Build a MotionPlanRequest moving *group_name* to a named SRDF target.
 
     The MoveGroup action goal only accepts explicit joint values or Cartesian
     poses (named-target resolution lives in a separate move_group service, not
-    the action). Without moveit_py we therefore embed the known SRDF joint
-    values (``_SRDF_STATES``) directly as per-DOF JointConstraints, keeping the
-    node self-contained.
+    the action). Without moveit_py we therefore read the SRDF's own
+    ``group_state`` joint values (see ``_get_srdf_states()``) and embed them
+    directly as per-DOF JointConstraints, keeping the node self-contained.
+
+    *planning_frame* stamps the workspace_parameters sampling box. It must
+    match the SRDF virtual_joint's parent frame (jetank_moveit_config/config/
+    jetank.srdf), which is ``odom`` — the static world->odom TF was removed,
+    so a stray "world" here would name a frame absent from the TF tree.
     """
     req = MotionPlanRequest()
     req.group_name = group_name
@@ -139,13 +178,15 @@ def _named_target_request(
     req.num_planning_attempts = num_attempts
     req.max_velocity_scaling_factor = vel_scale
     req.max_acceleration_scaling_factor = acc_scale
-    req.workspace_parameters.header.frame_id = "world"
+    req.workspace_parameters.header.frame_id = planning_frame
 
-    # Named target joint values from jetank.srdf — kept in sync manually.
-    # If the SRDF changes, update _SRDF_STATES below.
-    joint_targets = _SRDF_STATES.get(named_target)
+    # Named target joint values, read straight from jetank.srdf's own
+    # group_state elements (see _get_srdf_states()) instead of a
+    # hand-maintained copy.
+    srdf_states = _get_srdf_states()
+    joint_targets = srdf_states.get(named_target)
     if joint_targets is None:
-        raise ValueError(f"Unknown SRDF state: {named_target!r}. Known: {list(_SRDF_STATES)}")
+        raise ValueError(f"Unknown SRDF state: {named_target!r}. Known: {list(srdf_states)}")
 
     c = Constraints()
     c.name = named_target
@@ -315,42 +356,79 @@ def _pose_target_request(
     return req
 
 
-# SRDF arm group_state joint values (mirror of jetank_moveit_config/config/jetank.srdf).
-# Update here if the SRDF changes.
-_SRDF_STATES: dict = {
-    "home": {
-        "S1_joint": 0.0,
-        "S2_joint": 0.0,
-        "S3_joint": 0.0,
-        "S5_joint": 0.0,
-    },
-    "ready": {
-        "S1_joint": 0.0,
-        "S2_joint": -0.785,
-        "S3_joint": 1.047,
-        "S5_joint": 0.0,
-    },
-    # Forward grasp poses, tuned from RViz (degrees -> rad):
-    #   grasp_reach: S2=105deg=1.8326, S3=-15deg=-0.262 — reaches floor level.
-    #     S2=100deg/1.745 left the gripper ~8-10 cm ABOVE a floor sock (claws shut
-    #     in the air above it). S2>=107deg drives the gripper INTO the floor and
-    #     the trajectory controller TIMED_OUT / CONTROL_FAILED (jammed target).
-    #     105deg completes cleanly (swept 110->100 by 1deg; 106 also worked, 105
-    #     kept for margin). Re-tune here if the floor height changes.
-    #   grasp_pre:   derived raised approach (S2=70deg=1.222, same S3)
-    "grasp_pre": {
-        "S1_joint": 0.0,
-        "S2_joint": 1.222,
-        "S3_joint": -0.262,
-        "S5_joint": 0.0,
-    },
-    "grasp_reach": {
-        "S1_joint": 0.0,
-        "S2_joint": 1.8326,
-        "S3_joint": -0.262,
-        "S5_joint": 0.0,
-    },
-}
+# SRDF arm group_state joint values.
+#
+# Previously a hand-maintained mirror of jetank_moveit_config/config/jetank.srdf
+# (updated here whenever the SRDF changed) -- it had already drifted: it
+# carried an S5_joint=0.0 entry in every state even though jetank.srdf's 'arm'
+# group is base_link->S4_link (S1/S2/S3 only; S5 stays a hardware-only joint,
+# never part of MoveIt planning). Read the SRDF itself instead, so there is
+# exactly one source of truth and this can no longer silently fall out of
+# sync with it. See _get_srdf_states() / _srdf_path() below.
+#
+# Forward grasp poses, tuned from RViz (degrees -> rad), for reference:
+#   grasp_reach: S2=105deg=1.8326, S3=-15deg=-0.262 — reaches floor level.
+#     S2=100deg/1.745 left the gripper ~8-10 cm ABOVE a floor sock (claws shut
+#     in the air above it). S2>=107deg drives the gripper INTO the floor and
+#     the trajectory controller TIMED_OUT / CONTROL_FAILED (jammed target).
+#     105deg completes cleanly (swept 110->100 by 1deg; 106 also worked, 105
+#     kept for margin). Re-tune in jetank.srdf if the floor height changes.
+#   grasp_pre:   derived raised approach (S2=70deg=1.222, same S3)
+
+
+def _srdf_path() -> str:
+    """
+    Return the on-disk path of jetank_moveit_config/config/jetank.srdf.
+
+    Prefers the installed package share directory (ament_index, the normal
+    runtime path); falls back to the sibling-package source path so this
+    still resolves in a bare source checkout with no colcon build (that's
+    how test_import.py loads this module -- see its module docstring).
+    """
+    if get_package_share_directory is not None:
+        try:
+            return os.path.join(
+                get_package_share_directory('jetank_moveit_config'),
+                'config', 'jetank.srdf',
+            )
+        except Exception:
+            pass  # package not built/sourced -- fall through to the source path
+    return os.path.abspath(os.path.join(
+        os.path.dirname(__file__), '..', '..',
+        'jetank_moveit_config', 'config', 'jetank.srdf',
+    ))
+
+
+_srdf_states_cache = None
+
+
+def _get_srdf_states(srdf_path: str = None) -> dict:
+    """
+    Return the arm group's named states parsed from jetank.srdf.
+
+    Shape: ``{state_name: {joint_name: value}}`` from the ``<group_state>``
+    elements whose group is ``arm``.
+
+    Cached after the first call (with the default path) since the SRDF does
+    not change at runtime. Pass an explicit *srdf_path* (bypassing the cache)
+    to parse a specific file, e.g. from a test.
+    """
+    global _srdf_states_cache
+    if srdf_path is None and _srdf_states_cache is not None:
+        return _srdf_states_cache
+    path = srdf_path if srdf_path is not None else _srdf_path()
+    root = ET.parse(path).getroot()
+    states = {}
+    for state_el in root.findall('group_state'):
+        if state_el.get('group') != ARM_GROUP:
+            continue
+        states[state_el.get('name')] = {
+            joint_el.get('name'): float(joint_el.get('value'))
+            for joint_el in state_el.findall('joint')
+        }
+    if srdf_path is None:
+        _srdf_states_cache = states
+    return states
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +463,15 @@ class GraspServer(Node):
     def __init__(self) -> None:
         super().__init__("grasp_server")
 
+        # Parse the SRDF named states once at start so a missing or malformed
+        # SRDF fails fast here instead of escaping the first goal callback.
+        try:
+            if not _get_srdf_states():
+                raise ValueError("no 'arm' group_state elements in the SRDF")
+        except (OSError, ET.ParseError, ValueError, TypeError) as exc:
+            self.get_logger().fatal(f"cannot read SRDF named states: {exc}")
+            raise
+
         # Parameters (all tunable via grasp_poses.yaml)
         # Speed-optimised 2026-06-10 (grasp was ~60-90s; see plans/
         # grasp-speed-optimization-plan.md): faster vel/acc, and a tight planning
@@ -418,6 +505,15 @@ class GraspServer(Node):
         # any reachable wrist orientation. Set True only for a higher-DOF arm or
         # deliberate experimentation (then it is a loose best-effort hint).
         self.declare_parameter("pose_grasp.pose_use_orientation", False)
+        # MoveIt planning frame (jetank.srdf virtual_joint parent_frame). Matches
+        # mobile_grasp_coordinator's "world_frame" param default.
+        self.declare_parameter("planning_frame", "odom")
+        # GripperCommand action name. Default is the REAL endpoint on this
+        # build's standalone-controller_manager launch path; see the
+        # _GRIPPER_ACTION comment above. Override to
+        # "/gripper_controller/gripper_cmd" for the sim path or once a
+        # coherent ros2_control snapshot restores per-controller node names.
+        self.declare_parameter("gripper_action", _GRIPPER_ACTION)
 
         self._cb_group = ReentrantCallbackGroup()
 
@@ -431,13 +527,18 @@ class GraspServer(Node):
 
         # GripperCommand action client
         # Replaces Float64MultiArray publisher — sends GripperCommand goals to
-        # GripperActionController at /gripper_controller/gripper_cmd.
+        # GripperActionController at the resolved `gripper_action` name (see
+        # the _GRIPPER_ACTION / parameter comments above).
+        self._gripper_action = self.get_parameter("gripper_action").value
         self._gripper_client = ActionClient(
             self,
             GripperCommand,
-            _GRIPPER_ACTION,
+            self._gripper_action,
             callback_group=self._cb_group,
         )
+        # Gripper action-server discovery state — see _command_gripper.
+        self._gripper_seen = False
+        self._gripper_warned = False
 
         # GraspObject action server
         self._action_server = ActionServer(
@@ -589,13 +690,26 @@ class GraspServer(Node):
         Returns True if the action server accepted the goal and returned a
         result (stall or success); False if the server is absent — the
         caller degrades gracefully and the grasp sequence continues.
+
+        Once discovery has succeeded once, ``wait_for_server`` is expected to
+        return near-instantly (the action is already known to the graph), so
+        it keeps the full timeout as a generous margin against a transient
+        blip. Until then — e.g. the controller is not yet spawned/active —
+        every goal calls this twice (open + close), so a full 5 s timeout on
+        each burns 10 s/goal; use a short timeout instead and retry on the
+        next call rather than caching a permanent negative result. The
+        "not available" warning itself is logged only once, not once per call.
         """
-        if not self._gripper_client.wait_for_server(timeout_sec=5.0):
-            self.get_logger().warn(
-                f"GripperCommand action server {_GRIPPER_ACTION} not available — "
-                "skipping gripper command."
-            )
+        timeout_s = 5.0 if self._gripper_seen else 0.2
+        if not self._gripper_client.wait_for_server(timeout_sec=timeout_s):
+            if not self._gripper_warned:
+                self.get_logger().warn(
+                    f"GripperCommand action server {self._gripper_action} not "
+                    "available — skipping gripper command(s) until it appears."
+                )
+                self._gripper_warned = True
             return False
+        self._gripper_seen = True
 
         gripper_goal = GripperCommand.Goal()
         gripper_goal.command.position = width
@@ -628,6 +742,7 @@ class GraspServer(Node):
                 p.num_attempts,
                 p.vel_scale,
                 p.acc_scale,
+                planning_frame=self.get_parameter("planning_frame").value,
             )
         except ValueError as exc:
             self.get_logger().error(str(exc))
@@ -777,11 +892,16 @@ class GraspServer(Node):
             f"pre-grasp z={pre_grasp_pose.pose.position.z:.3f} m."
         )
 
-        # Step 1: move to approach (preset 'ready' — known-safe starting pose)
-        self._publish_stage(goal_handle, "moving_to_approach")
-        if not await self._move_to_named(p.t_approach, p):
-            await self._abort_and_retreat(goal_handle, result, p)
-            return result
+        # Step 1: move to approach (preset 'ready' — known-safe starting pose).
+        # SKIPPED when t_approach is empty (default, per grasp_poses.yaml), same
+        # guard as the preset path (_run_preset_grasp) — unguarded, this named
+        # target lookup raises ValueError on "", which _move_to_named turns into
+        # a False return, aborting every pose-targeted goal under shipped defaults.
+        if p.t_approach:
+            self._publish_stage(goal_handle, "moving_to_approach")
+            if not await self._move_to_named(p.t_approach, p):
+                await self._abort_and_retreat(goal_handle, result, p)
+                return result
 
         # Step 2: pre-grasp (target pose raised by approach_height)
         self._publish_stage(goal_handle, "pre_grasp")

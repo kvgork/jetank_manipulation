@@ -161,10 +161,24 @@ class BaseApproachNode(Node):
         cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
         self._cmd_pub = self.create_publisher(TwistStamped, cmd_vel_topic, 10)
 
-        self._tf_buffer = tf2_ros.Buffer()
-        self._tf_listener = tf2_ros.TransformListener(
-            self._tf_buffer, self, spin_thread=False
-        )
+        # TF buffer/listener are created lazily, only for the duration of an
+        # active /approach_target goal (see _execute_cb), instead of for the
+        # node's whole lifetime: the Python callback ingesting every /tf
+        # message (~47 Hz from robot_state_publisher + joint_state_broadcaster)
+        # measured ~13% CPU idle with nothing to look up. All TF use is
+        # confined to _execute_cb's call tree (_snapshot_target,
+        # _target_in_base), so this changes no lookup behaviour.
+        #
+        # The buffer/listener are kept as LOCAL variables in _execute_cb (never
+        # stored on self): _goal_cb accepts every goal unconditionally and the
+        # action server runs under a MultiThreadedExecutor/ReentrantCallbackGroup,
+        # so two goals can be executing concurrently. Storing them on self and
+        # tearing down via `self._tf_listener`/`self._tf_buffer` in `finally`
+        # used to unregister/null out whichever invocation's listener finished
+        # first -- clobbering the OTHER, still-running goal's buffer (its next
+        # TF lookup then hits `None.transform` -> AttributeError -> abort) while
+        # the finishing goal's own listener was never actually unregistered
+        # (permanent leak of the ~13% CPU this laziness was meant to remove).
 
         self._action_server = ActionServer(
             self,
@@ -193,6 +207,23 @@ class BaseApproachNode(Node):
         return CancelResponse.ACCEPT
 
     async def _execute_cb(self, goal_handle):
+        """
+        Create the TF listener for this goal's duration, then run it.
+
+        `tf_buffer`/`tf_listener` are local to this invocation and passed
+        down explicitly (see the note in __init__) so a concurrent goal's
+        teardown can never touch this goal's buffer.
+        """
+        tf_buffer = tf2_ros.Buffer()
+        tf_listener = tf2_ros.TransformListener(
+            tf_buffer, self, spin_thread=False
+        )
+        try:
+            return await self._execute_cb_impl(goal_handle, tf_buffer)
+        finally:
+            tf_listener.unregister()
+
+    async def _execute_cb_impl(self, goal_handle, tf_buffer):
         goal = goal_handle.request
         base_frame = self.get_parameter("base_frame").value
         k_lin = float(self.get_parameter("k_lin").value)
@@ -217,7 +248,9 @@ class BaseApproachNode(Node):
         # (e.g. a sensed centroid): re-TFing base->base every tick is identity,
         # so the target would stay a fixed distance ahead forever. Snapshotting
         # into odom makes it a world-fixed point the base can actually reach.
-        loop_target = self._snapshot_target(goal.target, stable_frame, base_frame)
+        loop_target = self._snapshot_target(
+            goal.target, stable_frame, base_frame, tf_buffer
+        )
 
         self.get_logger().info(
             f"ApproachTarget: target frame='{goal.target.header.frame_id}' "
@@ -258,7 +291,7 @@ class BaseApproachNode(Node):
                     return result
 
                 # TF the (stable-frame) target into the base frame for this tick.
-                dx_dy = self._target_in_base(loop_target, base_frame)
+                dx_dy = self._target_in_base(loop_target, base_frame, tf_buffer)
                 if dx_dy is None:
                     # Transient TF gap: hold still, retry next tick.
                     self._stop()
@@ -309,7 +342,7 @@ class BaseApproachNode(Node):
     # Helpers
     # ------------------------------------------------------------------
 
-    def _snapshot_target(self, target, stable_frame, base_frame):
+    def _snapshot_target(self, target, stable_frame, base_frame, tf_buffer):
         """
         Transform *target* once into *stable_frame* (a world-fixed frame).
 
@@ -317,6 +350,18 @@ class BaseApproachNode(Node):
         if it is already in stable_frame, or if the TF is unavailable (then the
         loop tracks it in its given frame — which only converges if that frame is
         itself world-fixed, so a base-frame target would not; we warn in that case).
+
+        Looks up the transform at the LATEST time (``Time()``), never at
+        *target*'s own stamp: the lazy per-goal buffer/listener created in
+        _execute_cb starts cold (no history), and the coordinator stamps
+        `target` with ``now()`` right before ``send_goal``
+        (mobile_grasp_coordinator.py), so every /tf message this fresh buffer
+        ever receives postdates that stamp -- a stamped lookup would always
+        raise ExtrapolationException ("extrapolation into the past") and could
+        never succeed within the timeout, no matter how long we poll. We assume
+        the base is stationary between detection (when `target` was stamped)
+        and goal start, so looking up "latest" instead of the original stamp is
+        equivalent in practice and converges as soon as one /tf message arrives.
         """
         if not stable_frame or target.header.frame_id == stable_frame:
             # Track at LATEST time: a world-fixed point looked up against the
@@ -326,10 +371,20 @@ class BaseApproachNode(Node):
             out = deepcopy(target)
             out.header.stamp = Time().to_msg()
             return out
+        timeout = rclpy.duration.Duration(seconds=0.5)
         try:
-            snap = self._tf_buffer.transform(
-                target, stable_frame,
-                timeout=rclpy.duration.Duration(seconds=0.5),
+            # Wait for the transform to exist at "latest" (see docstring)
+            # rather than attempting the stamped lookup first: on a cold
+            # buffer that stamped attempt is guaranteed to raise
+            # ExtrapolationException every time, not just occasionally miss,
+            # so there is nothing to gain from trying it before falling back.
+            tf_buffer.can_transform(
+                stable_frame, target.header.frame_id, Time(), timeout=timeout
+            )
+            snap_request = deepcopy(target)
+            snap_request.header.stamp = Time().to_msg()
+            snap = tf_buffer.transform(
+                snap_request, stable_frame, timeout=timeout,
             )
             # Zero the stamp so per-tick lookups use the LATEST odom->base TF
             # (the point is world-fixed in stable_frame; see note above).
@@ -353,13 +408,13 @@ class BaseApproachNode(Node):
                 )
             return target
 
-    def _target_in_base(self, target, base_frame):
+    def _target_in_base(self, target, base_frame, tf_buffer):
         """Return (dx, dy) of *target* in *base_frame*, or None on TF failure."""
         if target.header.frame_id == base_frame or not target.header.frame_id:
             return float(target.point.x), float(target.point.y)
         try:
             # Latest available transform (Time() == 0).
-            transformed = self._tf_buffer.transform(
+            transformed = tf_buffer.transform(
                 target,
                 base_frame,
                 timeout=rclpy.duration.Duration(seconds=0.1),
