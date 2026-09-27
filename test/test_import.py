@@ -186,7 +186,8 @@ def test_srdf_states_exact_values():
 
 
 def test_every_state_has_three_dof():
-    """All 'arm' group_states cover exactly the 3 actuated joints (S1/S2/S3).
+    """
+    All 'arm' group_states cover exactly the 3 actuated joints (S1/S2/S3).
 
     S5 is a torque-held hardware joint, never part of the 'arm' SRDF group --
     a state carrying it (as the old hand-maintained mirror did) would put a

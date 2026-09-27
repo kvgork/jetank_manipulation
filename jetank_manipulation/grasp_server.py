@@ -404,8 +404,10 @@ _srdf_states_cache = None
 
 def _get_srdf_states(srdf_path: str = None) -> dict:
     """
-    Return ``{state_name: {joint_name: value}}`` for the ``arm`` group's
-    ``<group_state>`` elements in jetank.srdf.
+    Return the arm group's named states parsed from jetank.srdf.
+
+    Shape: ``{state_name: {joint_name: value}}`` from the ``<group_state>``
+    elements whose group is ``arm``.
 
     Cached after the first call (with the default path) since the SRDF does
     not change at runtime. Pass an explicit *srdf_path* (bypassing the cache)
@@ -460,6 +462,14 @@ class GraspServer(Node):
 
     def __init__(self) -> None:
         super().__init__("grasp_server")
+
+        # Parse the SRDF named states once at start so a missing or malformed
+        # SRDF fails fast here instead of escaping the first goal callback.
+        try:
+            _get_srdf_states()
+        except (OSError, ET.ParseError, ValueError) as exc:
+            self.get_logger().fatal(f"cannot read SRDF named states: {exc}")
+            raise
 
         # Parameters (all tunable via grasp_poses.yaml)
         # Speed-optimised 2026-06-10 (grasp was ~60-90s; see plans/
