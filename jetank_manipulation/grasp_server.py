@@ -466,8 +466,9 @@ class GraspServer(Node):
         # Parse the SRDF named states once at start so a missing or malformed
         # SRDF fails fast here instead of escaping the first goal callback.
         try:
-            _get_srdf_states()
-        except (OSError, ET.ParseError, ValueError) as exc:
+            if not _get_srdf_states():
+                raise ValueError("no 'arm' group_state elements in the SRDF")
+        except (OSError, ET.ParseError, ValueError, TypeError) as exc:
             self.get_logger().fatal(f"cannot read SRDF named states: {exc}")
             raise
 
