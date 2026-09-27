@@ -10,10 +10,10 @@ Sequence:
   ready -> grasp_pre -> open gripper -> grasp_reach -> close gripper -> ready -> home
 
 Gripper is commanded via control_msgs/action/GripperCommand, action name given
-by the ``gripper_action`` parameter (default ``/controller_manager/gripper_cmd``
--- see the ``_GRIPPER_ACTION`` note below for why that, and not the
-seemingly-obvious ``/gripper_controller/gripper_cmd``, is the real endpoint on
-this build's standalone-controller_manager launch path).
+by the ``gripper_action`` parameter (default ``/gripper_controller/gripper_cmd``,
+the per-controller name served in sim). On hardware the launch overrides it to
+``/controller_manager/gripper_cmd`` -- see the ``_GRIPPER_ACTION`` note below for
+why that is the real endpoint on the standalone-controller_manager launch path).
 gripper_right_joint is mirrored by the ros2_control native mimic mechanism.
 
 Usage:
