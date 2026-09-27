@@ -787,11 +787,16 @@ class GraspServer(Node):
             f"pre-grasp z={pre_grasp_pose.pose.position.z:.3f} m."
         )
 
-        # Step 1: move to approach (preset 'ready' — known-safe starting pose)
-        self._publish_stage(goal_handle, "moving_to_approach")
-        if not await self._move_to_named(p.t_approach, p):
-            await self._abort_and_retreat(goal_handle, result, p)
-            return result
+        # Step 1: move to approach (preset 'ready' — known-safe starting pose).
+        # SKIPPED when t_approach is empty (default, per grasp_poses.yaml), same
+        # guard as the preset path (_run_preset_grasp) — unguarded, this named
+        # target lookup raises ValueError on "", which _move_to_named turns into
+        # a False return, aborting every pose-targeted goal under shipped defaults.
+        if p.t_approach:
+            self._publish_stage(goal_handle, "moving_to_approach")
+            if not await self._move_to_named(p.t_approach, p):
+                await self._abort_and_retreat(goal_handle, result, p)
+                return result
 
         # Step 2: pre-grasp (target pose raised by approach_height)
         self._publish_stage(goal_handle, "pre_grasp")
