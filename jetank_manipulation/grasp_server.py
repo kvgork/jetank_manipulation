@@ -122,6 +122,7 @@ def _named_target_request(
     num_attempts: int,
     vel_scale: float,
     acc_scale: float,
+    planning_frame: str = "odom",
 ) -> MotionPlanRequest:
     """
     Build a MotionPlanRequest moving *group_name* to a named SRDF target.
@@ -131,6 +132,11 @@ def _named_target_request(
     the action). Without moveit_py we therefore embed the known SRDF joint
     values (``_SRDF_STATES``) directly as per-DOF JointConstraints, keeping the
     node self-contained.
+
+    *planning_frame* stamps the workspace_parameters sampling box. It must
+    match the SRDF virtual_joint's parent frame (jetank_moveit_config/config/
+    jetank.srdf), which is ``odom`` — the static world->odom TF was removed,
+    so a stray "world" here would name a frame absent from the TF tree.
     """
     req = MotionPlanRequest()
     req.group_name = group_name
@@ -139,7 +145,7 @@ def _named_target_request(
     req.num_planning_attempts = num_attempts
     req.max_velocity_scaling_factor = vel_scale
     req.max_acceleration_scaling_factor = acc_scale
-    req.workspace_parameters.header.frame_id = "world"
+    req.workspace_parameters.header.frame_id = planning_frame
 
     # Named target joint values from jetank.srdf — kept in sync manually.
     # If the SRDF changes, update _SRDF_STATES below.
@@ -418,6 +424,9 @@ class GraspServer(Node):
         # any reachable wrist orientation. Set True only for a higher-DOF arm or
         # deliberate experimentation (then it is a loose best-effort hint).
         self.declare_parameter("pose_grasp.pose_use_orientation", False)
+        # MoveIt planning frame (jetank.srdf virtual_joint parent_frame). Matches
+        # mobile_grasp_coordinator's "world_frame" param default.
+        self.declare_parameter("planning_frame", "odom")
 
         self._cb_group = ReentrantCallbackGroup()
 
@@ -628,6 +637,7 @@ class GraspServer(Node):
                 p.num_attempts,
                 p.vel_scale,
                 p.acc_scale,
+                planning_frame=self.get_parameter("planning_frame").value,
             )
         except ValueError as exc:
             self.get_logger().error(str(exc))

@@ -216,7 +216,10 @@ def test_request_top_level_fields():
     assert req.num_planning_attempts == 3
     assert req.max_velocity_scaling_factor == pytest.approx(0.3)
     assert req.max_acceleration_scaling_factor == pytest.approx(0.3)
-    assert req.workspace_parameters.header.frame_id == "world"
+    # jetank.srdf virtual_joint parent_frame is "odom" (static world->odom TF
+    # was removed); the workspace box must be stamped in a frame the TF tree
+    # actually has.
+    assert req.workspace_parameters.header.frame_id == "odom"
 
 
 def test_request_one_constraint_block_named_after_target():
