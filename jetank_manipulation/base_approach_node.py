@@ -207,7 +207,8 @@ class BaseApproachNode(Node):
         return CancelResponse.ACCEPT
 
     async def _execute_cb(self, goal_handle):
-        """Create the TF listener for this goal's duration, then run it.
+        """
+        Create the TF listener for this goal's duration, then run it.
 
         `tf_buffer`/`tf_listener` are local to this invocation and passed
         down explicitly (see the note in __init__) so a concurrent goal's

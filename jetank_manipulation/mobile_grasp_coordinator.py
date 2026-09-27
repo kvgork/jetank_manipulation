@@ -161,7 +161,8 @@ class MobileGraspCoordinator(Node):
     # ------------------------------------------------------------------
 
     def _on_trigger(self, _request, response):
-        """Create the TF listener for this call's duration, then run it.
+        """
+        Create the TF listener for this call's duration, then run it.
 
         `tf_buffer`/`tf_listener` are local to this invocation and passed
         down explicitly (see the note in __init__) so a concurrent call's
